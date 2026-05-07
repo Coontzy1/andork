@@ -1,0 +1,43 @@
+# Super-simple dorks (short, readable, high-utility)
+# Placeholders: {site}, {domain}
+
+{site} login
+{site} signin
+{site} admin
+{site} dashboard
+{site} portal
+{site} "index of"
+{site} "index of" backup
+{site} "index of" dump
+{site} "index of" config
+{site} "index of" password
+{site} inurl:login
+{site} inurl:admin
+{site} inurl:auth
+{site} inurl:vpn
+{site} inurl:remote/login
+{site} inurl:phpmyadmin
+{site} inurl:.git
+{site} inurl:.env
+{site} filetype:env
+{site} filetype:sql
+{site} filetype:log password
+{site} filetype:txt password
+{site} filetype:xls password
+{site} filetype:xlsx password
+{site} DB_PASSWORD
+{site} DATABASE_URL
+{site} aws_access_key_id
+{site} aws_secret_access_key
+{site} api_key
+{site} secret_key
+{site} client_secret
+{site} access_token
+{site} "BEGIN RSA PRIVATE KEY"
+{site} "BEGIN OPENSSH PRIVATE KEY"
+{site} "phpMyAdmin SQL Dump"
+{site} "MySQL dump"
+{site} "PostgreSQL database dump"
+site:s3.amazonaws.com "{domain}"
+site:storage.googleapis.com "{domain}"
+site:blob.core.windows.net "{domain}"

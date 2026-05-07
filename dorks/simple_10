@@ -1,0 +1,10 @@
+# Super-simple dorks (short, readable, high-utility)
+# Placeholders: {site}, {domain}
+
+{site} login
+{site} signin
+{site} admin
+{site} dashboard
+{site} portal
+{site} "index of"
+{site} "index of" backup

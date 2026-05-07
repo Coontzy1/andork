@@ -1,0 +1,63 @@
+# Simple high-signal dorks for target-domain workflows.
+# Placeholders: {site} -> site:target.tld, {domain} -> target.tld
+
+{site} (inurl:login OR inurl:signin OR inurl:auth)
+{site} inurl:admin
+{site} (intitle:dashboard OR inurl:dashboard)
+{site} (inurl:sso OR inurl:saml OR inurl:oauth)
+{site} (inurl:owa OR inurl:autodiscover OR inurl:ews)
+{site} (inurl:vpn OR inurl:remote/login)
+{site} (inurl:portal OR intitle:"employee portal")
+{site} intitle:"index of"
+{site} intitle:"index of" (backup OR dump OR db)
+{site} intitle:"index of" (.env OR config OR credentials)
+{site} (inurl:.git/config OR inurl:.git/HEAD)
+{site} inurl:.svn
+{site} (inurl:.env OR filetype:env)
+{site} (inurl:web.config OR filetype:config web.config)
+{site} (inurl:wp-config.php OR filetype:php inurl:config)
+{site} (filetype:ini OR filetype:cfg OR filetype:conf)
+{site} (filetype:yml OR filetype:yaml) (password OR secret OR token)
+{site} filetype:json (apikey OR api_key OR secret OR password)
+{site} filetype:xml (inurl:config OR inurl:settings)
+{site} (inurl:application.properties OR filetype:properties)
+{site} (filetype:sql OR ext:dump OR ext:bak OR ext:backup)
+{site} (filetype:db OR ext:sqlite)
+{site} (filetype:zip OR filetype:tar OR filetype:gz) (backup OR dump)
+{site} (ext:swp OR ext:swo OR ext:tmp)
+{site} (intext:"phpMyAdmin SQL Dump" OR intext:"MySQL dump")
+{site} (intext:"PostgreSQL database dump" OR intext:"pg_dump")
+{site} (intext:"aws_access_key_id" OR intext:"aws_secret_access_key")
+{site} (intext:"AKIA" OR intext:"x-api-key" OR intext:"api_key")
+{site} (intext:"-----BEGIN RSA PRIVATE KEY-----" OR intext:"BEGIN OPENSSH PRIVATE KEY")
+{site} (intext:"access_token" OR intext:"client_secret")
+{site} (intext:"mongodb://" OR intext:"mongodb+srv://")
+{site} (intext:"jdbc:" OR intext:"postgres://")
+{site} (intext:"DB_PASSWORD" OR intext:"DATABASE_URL")
+{site} (intext:"secret_key" OR intext:"JWT" OR intext:"Bearer ")
+{site} intext:password (filetype:txt OR filetype:log OR filetype:csv)
+{site} inurl:server-status
+{site} (intext:"Traceback (most recent call last)" OR intext:"Stack trace")
+{site} (intext:"You have an error in your SQL syntax" OR intext:"sql syntax near")
+{site} (intext:"DEBUG = True" OR intitle:"DisallowedHost")
+{site} (intext:"Server Error in" OR intext:"System.Web.HttpException")
+{site} (intext:"java.lang." AND intext:"Exception")
+{site} (inurl:jenkins OR intitle:"Dashboard [Jenkins]")
+{site} (inurl:gitlab OR intitle:"GitLab")
+{site} (inurl:grafana OR intitle:"Grafana")
+{site} (inurl:kibana OR intitle:"Kibana")
+{site} (inurl:prometheus OR intitle:"Prometheus")
+{site} (inurl:confluence OR intitle:"Confluence")
+{site} (inurl:jira OR intitle:"Issue Navigator")
+{site} (inurl:sharepoint OR intitle:"SharePoint")
+{site} (inurl:phpmyadmin OR intitle:phpmyadmin)
+{site} (inurl:Citrix OR inurl:StoreWeb)
+{site} (inurl:dana-na/auth OR inurl:dana/home)
+{site} (inurl:global-protect OR intitle:"GlobalProtect")
+{site} (inurl:sonicwall OR intitle:"SonicWall - Authentication")
+{site} (inurl:fortinet OR inurl:remote/login)
+site:s3.amazonaws.com "{domain}"
+site:storage.googleapis.com "{domain}"
+site:blob.core.windows.net "{domain}"
+(site:drive.google.com OR site:docs.google.com) "{domain}"
+site:1drv.ms "{domain}"

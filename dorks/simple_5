@@ -1,0 +1,5 @@
+# Super-simple dorks (short, readable, high-utility)
+# Placeholders: {site}, {domain}
+
+{site} login
+{site} signin

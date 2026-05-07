@@ -1,0 +1,32 @@
+# Runtime/output artifacts
+output/
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.build/
+build/
+dist/
+
+# Virtual environments
+venv/
+.venv/
+
+# Local tooling state
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Generated docs/notes (keep only canonical README)
+*.md
+!README.md
+
+# Optional local dork outputs (keep curated source dorks)
+dorks/by_category/
+dorks/high_signal_*.dorks
+dorks/high_signal_ranked.json

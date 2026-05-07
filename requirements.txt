@@ -1,0 +1,4 @@
+requests>=2.31
+selenium>=4.18
+webdriver-manager>=4.0
+ddgs>=9.0

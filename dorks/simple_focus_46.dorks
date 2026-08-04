@@ -41,3 +41,13 @@
 site:s3.amazonaws.com "{domain}"
 site:storage.googleapis.com "{domain}"
 site:blob.core.windows.net "{domain}"
+
+# API endpoints
+{site} (inurl:swagger OR inurl:api-docs OR intitle:"Swagger UI")
+{site} (inurl:graphql OR inurl:graphiql)
+{site} (inurl:actuator OR inurl:actuator/env)
+
+# Exposed admin tools
+{site} (inurl:_cluster/health OR inurl:_cat/indices)
+{site} (inurl:adminer OR intitle:"Login - Adminer")
+{site} (inurl:pgadmin OR intitle:"pgAdmin")

@@ -61,3 +61,17 @@ site:storage.googleapis.com "{domain}"
 site:blob.core.windows.net "{domain}"
 (site:drive.google.com OR site:docs.google.com) "{domain}"
 site:1drv.ms "{domain}"
+
+# API endpoints & documentation
+{site} (inurl:swagger OR inurl:api-docs OR intitle:"Swagger UI")
+{site} (inurl:graphql OR inurl:graphiql OR intitle:"GraphQL")
+{site} (inurl:/api/v1 OR inurl:/api/v2 OR inurl:/api/v3)
+{site} (inurl:actuator OR inurl:actuator/health OR inurl:actuator/env)
+{site} (filetype:wsdl OR inurl:"?wsdl")
+
+# Exposed admin tools
+{site} (inurl:adminer OR intitle:"Login - Adminer")
+{site} (inurl:_cluster/health OR inurl:_cat/indices)
+{site} (inurl:pgadmin OR intitle:"pgAdmin")
+{site} (inurl:portainer OR intitle:"Portainer")
+{site} (inurl:mongo-express OR intitle:"Mongo Express")

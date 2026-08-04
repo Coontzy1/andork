@@ -44,13 +44,13 @@ pipx install . --force
 ### Dork mode (custom file)
 
 ```bash
-andork dork -d domain.com --dork-file dorks/simple_focus_40.dorks --headed --wait-for-captcha
+andork dork -d domain.com --dork-file dorks/simple_focus_46.dorks --headed --wait-for-captcha
 ```
 
 ### Dork mode (list only)
 
 ```bash
-andork dork -d domain.com --dork-file dorks/simple_focus_40.dorks --list-dorks
+andork dork -d domain.com --dork-file dorks/simple_focus_46.dorks --list-dorks
 ```
 
 ### Metadata mode

@@ -4,8 +4,9 @@
 Two modes:
   - metadata: dork search engines for documents on the target domain,
     download them, run exiftool, harvest authors/companies/paths.
-  - dork: 152 curated dorks across 12 categories (auth, config,
-    secrets, backups, errors, ...) — searches only, no downloads.
+  - dork: 174 curated dorks across 14 categories (auth, config,
+    secrets, api, admin_tools, backups, errors, ...) — searches only,
+    no downloads.
 
 Two search backends (DuckDuckGo via ddgs + Selenium-driven Chrome on
 Google), parallel per-engine rate limits. Non-intrusive: only fetches
@@ -38,6 +39,7 @@ from typing import Iterator, Optional
 
 MIN_SEARCH_DELAY = 30
 MIN_DOWNLOAD_DELAY = 30
+_CURRENT_YEAR = datetime.now().year
 
 DEFAULT_EXTS = ("pdf", "docx", "xlsx", "pptx", "csv", "zip", "doc")
 
@@ -116,7 +118,7 @@ DORKS_DB = {
         ("zip_archives",      '{site} (filetype:zip OR filetype:tar OR filetype:gz) (backup OR dump)'),
         ("swap_files",        '{site} (ext:swp OR ext:swo OR ext:tmp)'),
         ("rar_archives",      '{site} (filetype:rar OR filetype:7z OR filetype:bz2) (backup OR dump)'),
-        ("dated_archives",    '{site} (intitle:"index of" "2024" OR intitle:"index of" "2025") (.zip OR .tar)'),
+        ("dated_archives",    '{site} (intitle:"index of" "' + str(_CURRENT_YEAR) + '" OR intitle:"index of" "' + str(_CURRENT_YEAR - 1) + '") (.zip OR .tar)'),
         ("rsync_paths",       '{site} (inurl:rsync OR intext:"rsync://")'),
         ("mysql_dumps",       '{site} (intext:"-- MySQL dump" OR intext:"-- Server version")'),
         ("postgres_dumps",    '{site} (intext:"-- PostgreSQL database dump")'),
@@ -205,10 +207,10 @@ DORKS_DB = {
         ("env_secrets",       '{site} filetype:env (intext:secret OR intext:password)'),
         ("stripe_keys",       '{site} (intext:"sk_live_" OR intext:"pk_live_")'),
         ("twilio_keys",       '{site} (intext:"twilio_sid" OR intext:"twilio_auth_token")'),
-        ("sendgrid_keys",     '{site} intext:"SG.*"'),
+        ("sendgrid_keys",     '{site} (intext:"SG." intext:"apikey" OR intext:"SENDGRID_API_KEY")'),
         ("github_tokens",     '{site} (intext:"ghp_" OR intext:"github_token")'),
         ("slack_tokens",      '{site} (intext:"xoxb-" OR intext:"xoxp-")'),
-        ("jwt_tokens",        '{site} intext:"eyJ" intext:"."'),
+        ("jwt_tokens",        '{site} (intext:"eyJhbGciOi" OR (intext:"eyJ" intext:"Bearer"))'),
         ("google_keys",       '{site} (intext:"AIza" OR intext:"google_api_key")'),
         ("mongo_uri",         '{site} intext:"mongodb+srv://"'),
     ],
@@ -232,7 +234,51 @@ DORKS_DB = {
         ("alumni",            '{site} (intitle:"alumni" OR intitle:"former employees")'),
         ("press_releases",    '{site} (intitle:"press release" OR inurl:press)'),
     ],
+    "api": [
+        ("swagger_ui",        '{site} (inurl:swagger OR inurl:api-docs OR intitle:"Swagger UI")'),
+        ("graphql",           '{site} (inurl:graphql OR inurl:graphiql OR intitle:"GraphQL")'),
+        ("api_versions",      '{site} (inurl:/api/v1 OR inurl:/api/v2 OR inurl:/api/v3)'),
+        ("openapi_spec",      '{site} (filetype:json inurl:openapi OR filetype:yaml inurl:openapi)'),
+        ("postman",           '{site} (filetype:json intext:"postman_collection" OR inurl:postman)'),
+        ("api_debug",         '{site} inurl:api (intext:"error" OR intext:"stack trace")'),
+        ("wsdl",              '{site} (filetype:wsdl OR inurl:"?wsdl")'),
+        ("rest_docs",         '{site} (inurl:redoc OR inurl:api/docs OR intitle:"API Documentation")'),
+        ("api_keys_exposed",  '{site} inurl:api (filetype:json OR filetype:xml) (intext:"key" OR intext:"token")'),
+        ("actuator",          '{site} (inurl:actuator OR inurl:actuator/health OR inurl:actuator/env)'),
+    ],
+    "admin_tools": [
+        ("adminer",           '{site} (inurl:adminer OR intitle:"Login - Adminer")'),
+        ("redis_commander",   '{site} (inurl:redis-commander OR intitle:"Redis Commander")'),
+        ("mongo_express",     '{site} (inurl:mongo-express OR intitle:"Mongo Express")'),
+        ("elasticsearch",     '{site} (inurl:_cluster/health OR inurl:_cat/indices)'),
+        ("rabbitmq",          '{site} (inurl:rabbitmq OR intitle:"RabbitMQ Management")'),
+        ("solr",              '{site} (inurl:solr/admin OR intitle:"Solr Admin")'),
+        ("pgadmin",           '{site} (inurl:pgadmin OR intitle:"pgAdmin")'),
+        ("portainer",         '{site} (inurl:portainer OR intitle:"Portainer")'),
+        ("cockpit",           '{site} (inurl:cockpit OR intitle:"Web Console")'),
+        ("flower",            '{site} (inurl:flower OR intitle:"Celery Flower")'),
+        ("mailhog",           '{site} (inurl:mailhog OR intitle:"MailHog")'),
+        ("phpldapadmin",      '{site} (inurl:phpldapadmin OR intitle:"phpLDAPadmin")'),
+    ],
 }
+CATEGORY_SEVERITY = {
+    "secrets":     "critical",
+    "config":      "high",
+    "backups":     "high",
+    "admin_tools": "high",
+    "auth":        "medium",
+    "errors":      "medium",
+    "devops":      "medium",
+    "vpn":         "medium",
+    "api":         "medium",
+    "cloud":       "medium",
+    "internal":    "low",
+    "listings":    "low",
+    "media":       "info",
+    "users":       "info",
+}
+_SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/146.0.0.0 Safari/537.36"
@@ -314,13 +360,15 @@ class RateLimiter:
         self.delay = delay
         self.name = name
         self.last = 0.0
+        self._lock = threading.Lock()
 
     def wait(self):
-        rem = self.delay - (time.time() - self.last)
-        if rem > 0:
-            log.info("rate-limit[%s]: sleeping %.0fs", self.name, rem)
-            time.sleep(rem)
-        self.last = time.time()
+        with self._lock:
+            rem = self.delay - (time.time() - self.last)
+            if rem > 0:
+                log.info("rate-limit[%s]: sleeping %.0fs", self.name, rem)
+                time.sleep(rem)
+            self.last = time.time()
 
 
 # --------------------------- url helpers ---------------------------
@@ -438,18 +486,26 @@ def atomic_write_json(path: Path, obj) -> None:
     tmp.replace(path)
 
 
-def search_engines_parallel(engines: list, dork: str) -> dict[str, list]:
+@dataclass
+class SearchResult:
+    items: dict[str, list]
+    failed_engines: set[str]
+
+
+def search_engines_parallel(engines: list, dork: str) -> SearchResult:
     """Run a list of (name, engine) pairs against the same dork concurrently.
 
     Each engine has its own rate limiter, so DDG and Google run in parallel
-    without blocking each other. Returns {engine_name: [items]}.
+    without blocking each other. Returns a SearchResult with per-engine
+    items and a set of engines that encountered errors.
 
     Selenium itself isn't thread-safe, but we only ever have one Google
     search inflight per call, so a single thread per engine is fine.
     """
     out: dict[str, list] = {name: [] for name, _ in engines}
+    failed: set[str] = set()
     if not engines:
-        return out
+        return SearchResult(items=out, failed_engines=failed)
 
     def run_one(name: str, engine) -> None:
         try:
@@ -457,12 +513,13 @@ def search_engines_parallel(engines: list, dork: str) -> dict[str, list]:
                 out[name].append(item)
         except Exception as e:
             log.warning("%s: search error on %r: %s", name, dork, e)
+            failed.add(name)
 
     with ThreadPoolExecutor(max_workers=len(engines)) as ex:
         futures = [ex.submit(run_one, name, eng) for name, eng in engines]
         for f in futures:
-            f.result()  # surface anything unexpected
-    return out
+            f.result()
+    return SearchResult(items=out, failed_engines=failed)
 
 
 # --------------------------- DuckDuckGo ---------------------------
@@ -509,14 +566,12 @@ class DDGSearch:
                 log.warning("ddgs: error on %r: %s", dork, e)
             return
 
-        if results:
-            log.info("%sddgs: %d raw results for %r%s",
-                     C.GREEN, len(results), dork, C.RESET)
-        else:
-            log.info("ddgs: 0 raw results for %r", dork)
         if not results:
+            log.info("ddgs: 0 raw results for %r", dork)
             self._dump(dork, [])
             return
+        log.info("%sddgs: %d raw results for %r%s",
+                 C.GREEN, len(results), dork, C.RESET)
         for item in results:
             href = (
                 item.get("href")
@@ -782,9 +837,9 @@ class GoogleSelenium:
             self.driver = None
 
     def search(self, dork: str) -> Iterator[dict]:
-        """Yields {href, title, body} dicts. Title/body are empty strings;
-        Selenium SERP-scraping for snippets is too fragile across the
-        Google DOM variants we see. Use ddgs for snippet-rich data."""
+        """Yields {href, title, body} dicts. Title/body are best-effort
+        via container-based extraction; falls back to URL-only if the
+        Google DOM layout doesn't match known selectors."""
         if self.captcha_seen:
             return
         from selenium.webdriver.common.by import By
@@ -907,15 +962,14 @@ class GoogleSelenium:
             # Give JS a beat to populate result divs (some Google layouts
             # hydrate after initial render).
             time.sleep(1.5)
-            urls = self._extract_result_urls()
-            if urls:
+            items = self._extract_results()
+            if items:
                 log.info("%sgoogle page %d: %d raw results%s",
-                         C.GREEN, page, len(urls), C.RESET)
+                         C.GREEN, page, len(items), C.RESET)
             else:
                 log.info("google page %d: 0 raw results", page)
-            for u in urls:
-                yield {"href": u, "title": "", "body": ""}
-            if not urls:
+            yield from items
+            if not items:
                 self._dump(f"empty-p{page}")
                 return
 
@@ -952,23 +1006,75 @@ class GoogleSelenium:
                 continue
         return False
 
-    def _extract_result_urls(self) -> list:
-        """Pull result URLs across the various Google layouts seen in the wild."""
+    def _extract_results(self) -> list[dict]:
+        """Pull results with best-effort title/snippet extraction.
+
+        Tries container-based extraction first (find each result block,
+        then extract URL + title + snippet from within it). Falls back
+        to the broad anchor-scan if no containers match.
+        """
         from selenium.webdriver.common.by import By
-        # Anchors sit in different containers depending on the layout
-        # served. Collect from all and dedupe.
-        selectors = (
-            "div#search a[href]",
-            "div#rso a[href]",
-            "div#main a[href]",
-            "div[data-async-context] a[href]",
-            "div.MjjYud a[href]",
-            "div.tF2Cxc a[href]",
-            "div.g a[href]",
+        container_selectors = ("div.g", "div.tF2Cxc", "div.MjjYud")
+        title_selectors = ("h3", "a h3", "div[role='heading']")
+        snippet_selectors = (
+            "div.VwiC3b", "span.aCOpRe", "div[data-sncf]",
+            "div.IsZvec", "div[style*='line-clamp']",
         )
-        seen = set()
-        out = []
-        for sel in selectors:
+
+        seen: set[str] = set()
+        out: list[dict] = []
+
+        for csel in container_selectors:
+            for container in self.driver.find_elements(By.CSS_SELECTOR, csel):
+                try:
+                    anchors = container.find_elements(By.CSS_SELECTOR, "a[href]")
+                    href = ""
+                    for a in anchors:
+                        h = a.get_attribute("href") or ""
+                        real = self._unwrap_url_q(h)
+                        if real and real.startswith(("http://", "https://")):
+                            host = up.urlsplit(real).hostname or ""
+                            if not host.endswith(("google.com", "gstatic.com")):
+                                href = real
+                                break
+                    if not href or href in seen:
+                        continue
+
+                    title = ""
+                    for tsel in title_selectors:
+                        try:
+                            el = container.find_element(By.CSS_SELECTOR, tsel)
+                            title = (el.text or "").strip()
+                            if title:
+                                break
+                        except Exception:
+                            pass
+
+                    snippet = ""
+                    for ssel in snippet_selectors:
+                        try:
+                            el = container.find_element(By.CSS_SELECTOR, ssel)
+                            snippet = (el.text or "").strip()
+                            if snippet:
+                                break
+                        except Exception:
+                            pass
+
+                    seen.add(href)
+                    out.append({"href": href, "title": title, "body": snippet})
+                except Exception:
+                    continue
+
+        if out:
+            return out
+
+        # Fallback: broad anchor scan (no title/snippet)
+        fallback_selectors = (
+            "div#search a[href]", "div#rso a[href]", "div#main a[href]",
+            "div[data-async-context] a[href]", "div.MjjYud a[href]",
+            "div.tF2Cxc a[href]", "div.g a[href]",
+        )
+        for sel in fallback_selectors:
             for a in self.driver.find_elements(By.CSS_SELECTOR, sel):
                 try:
                     href = a.get_attribute("href") or ""
@@ -977,14 +1083,13 @@ class GoogleSelenium:
                 real = self._unwrap_url_q(href)
                 if not real or not real.startswith(("http://", "https://")):
                     continue
-                # Drop google's own URLs (UI links, "more results", etc.).
                 host = up.urlsplit(real).hostname or ""
-                if host.endswith("google.com") or host.endswith("gstatic.com"):
+                if host.endswith(("google.com", "gstatic.com")):
                     continue
                 if real in seen:
                     continue
                 seen.add(real)
-                out.append(real)
+                out.append({"href": real, "title": "", "body": ""})
         return out
 
     @staticmethod
@@ -1090,7 +1195,9 @@ def download_one(
                 head = fh.read(8)
             magic = EXT_MAGIC.get(ext, ())
             if magic and not any(head.startswith(m) for m in magic):
-                log.warning("magic mismatch %s: head=%r", url, head[:8])
+                log.warning("magic mismatch %s: head=%r — skipping", url, head[:8])
+                os.unlink(tf.name)
+                return None
         except Exception:
             pass
         shutil.move(tf.name, str(final))
@@ -1191,9 +1298,11 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("-o", "--output", default="./output")
     p.add_argument("--max-per-dork", type=int, default=100,
                    help="Max URLs to keep per dork (per engine)")
-    p.add_argument("--max-pages", type=int, default=5,
+    p.add_argument("--max-pages", type=int, default=None,
                    help="Max Google result pages per dork (1 page = 1 search). "
-                        "ddgs handles its own pagination internally.")
+                        "ddgs handles its own pagination internally. "
+                        "Default: 5 for metadata, 1 for curated dork, "
+                        "3 for custom dork-file.")
     p.add_argument("--search-delay", type=int, default=30,
                    help=f"Seconds between searches per engine "
                         f"(min {MIN_SEARCH_DELAY}; engines run in parallel)")
@@ -1239,7 +1348,7 @@ def parse_args():
         "  andork metadata -d domain.com --headed --wait-for-captcha \\\n"
         "      --user-data-dir ~/chrome_profile --allow-root\n"
         "\n"
-        "  # full dork sweep across all 152 dorks (~2.5h with 60s Google delay)\n"
+        "  # full dork sweep across all 174 dorks (~2.5h with 60s Google delay)\n"
         "  andork dork -d domain.com --headed --wait-for-captcha \\\n"
         "      --user-data-dir ~/chrome_profile --allow-root\n"
         "\n"
@@ -1305,7 +1414,7 @@ def parse_args():
     # --- dork mode ---
     pd_epilog = (
         "examples:\n"
-        "  # full sweep (152 dorks, ~2.5h, headed for CAPTCHA solving)\n"
+        "  # full sweep (174 dorks, ~2.5h, headed for CAPTCHA solving)\n"
         "  andork dork -d domain.com --headed --wait-for-captcha \\\n"
         "      --user-data-dir ~/chrome_profile --allow-root\n"
         "\n"
@@ -1317,7 +1426,7 @@ def parse_args():
         "  andork dork -d domain.com --list-dorks\n"
         "\n"
         "  # run a custom dork list file (one dork per line)\n"
-        "  andork dork -d domain.com --dork-file ./dorks/high_signal_top50.dorks\n"
+        "  andork dork -d domain.com --dork-file ./dorks/simple_high_signal_70.dorks\n"
         "\n"
         "  # DDG-only (no Chrome required, no CAPTCHA, fewer results)\n"
         "  andork dork -d domain.com --no-google\n"
@@ -1332,14 +1441,6 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_common_args(pd)
-    # Dork mode covers ~152 unique queries; cap Google to 1 page each by
-    # default since most dorks have <10 hits. Operator can raise it.
-    for action in pd._actions:
-        if action.dest == "max_pages":
-            action.default = 1
-            action.help = ("Max Google result pages per dork (default 1 in "
-                           "dork mode — there are 152 dorks, raise carefully).")
-            break
     pd.add_argument("--categories", default="all",
                     help=f"Comma list of categories or 'all'. "
                          f"Available: {','.join(DORKS_DB.keys())}")
@@ -1355,11 +1456,12 @@ def parse_args():
                          "(inurl/filetype/intitle/intext). Strict is on by "
                          "default — most search-engine fuzzy false positives "
                          "are caught here.")
+    pd.add_argument("--resume", dest="resume",
+                    action="store_true", default=True,
+                    help="Resume from previous run (skip completed dorks)")
+    pd.add_argument("--no-resume", dest="resume", action="store_false")
 
     args = parser.parse_args()
-    # Keep whether operator explicitly set max-pages so mode defaults can
-    # adapt without overriding intentional choices.
-    args._max_pages_explicit = "--max-pages" in sys.argv
     return args
 
 
@@ -1512,6 +1614,8 @@ def setup_logging(target_dir: Path) -> None:
 
 def cmd_metadata(args) -> int:
     args.domain = validate_domain(args.domain)
+    if args.max_pages is None:
+        args.max_pages = 5
 
     sd = max(args.search_delay, MIN_SEARCH_DELAY)
     dd = max(args.download_delay, MIN_DOWNLOAD_DELAY)
@@ -1577,8 +1681,8 @@ def cmd_metadata(args) -> int:
         for ext in exts:
             dork = f"site:{args.domain} filetype:{ext}"
             section(f"DORK: {dork}")
-            results = search_engines_parallel(engines, dork)
-            for engine_name, items in results.items():
+            sr = search_engines_parallel(engines, dork)
+            for engine_name, items in sr.items.items():
                 bucket = 0
                 for item in items:
                     if bucket >= args.max_per_dork:
@@ -1945,11 +2049,8 @@ def cmd_dork(args) -> int:
     target_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(target_dir)
 
-    # Curated mode intentionally defaults to 1 Google page per dork because
-    # it runs 152 queries. For custom dork files, use a deeper default unless
-    # the operator explicitly set --max-pages.
-    if args.dork_file and args.max_pages == 1 and not args._max_pages_explicit:
-        args.max_pages = 3
+    if args.max_pages is None:
+        args.max_pages = 3 if args.dork_file else 1
 
     log.info("=== dork mode: domain=%s ===", args.domain)
     log.info("source=%s | categories=%s | %d dorks total | "
@@ -1972,18 +2073,65 @@ def cmd_dork(args) -> int:
     engines = [(n, e) for n, e in (("ddg", ddg), ("google", google)) if e]
 
     findings_path = target_dir / "findings.json"
+    progress_path = target_dir / "progress.json"
     findings: list[dict] = []
-    seen: set[tuple[str, str]] = set()  # (dork_id, normalized_url)
+    seen: set[tuple[str, str]] = set()
+    completed_dorks: set[str] = set()
+
+    run_fingerprint = hashlib.sha256(json.dumps({
+        "domain": args.domain,
+        "source": source_label,
+        "dorks": [(c, d, q) for c, d, q in dorks],
+        "engines": [n for n, _ in engines],
+        "strict": strict,
+        "max_pages": args.max_pages,
+        "max_per_dork": args.max_per_dork,
+    }, sort_keys=True).encode()).hexdigest()[:16]
+
+    if args.resume and progress_path.exists():
+        try:
+            progress = json.loads(progress_path.read_text())
+            if isinstance(progress, dict) and progress.get("fingerprint") == run_fingerprint:
+                completed_dorks = set(progress.get("completed", []))
+                log.info("resumed: %d completed dorks (fingerprint match)",
+                         len(completed_dorks))
+            elif isinstance(progress, dict):
+                log.warning("progress fingerprint mismatch — previous run "
+                            "used different config; starting fresh")
+            else:
+                log.warning("progress file has old format; starting fresh")
+        except Exception as e:
+            log.warning("could not load progress for resume: %s", e)
+
+    if args.resume and completed_dorks and findings_path.exists():
+        try:
+            prev_findings = json.loads(findings_path.read_text())
+            for f in prev_findings:
+                if f.get("dork_id") in completed_dorks:
+                    findings.append(f)
+                    seen.add((f["dork_id"], f["url"]))
+            log.info("resumed: %d findings from completed dorks", len(findings))
+        except Exception as e:
+            log.warning("could not load findings for resume: %s", e)
+            findings = []
 
     strict = not args.no_strict
     total_dropped = 0
     total = len(dorks)
+    skipped = 0
     run_started = time.time()
     try:
         for idx, (cat, dork_id, query) in enumerate(dorks, start=1):
+            if dork_id in completed_dorks:
+                skipped += 1
+                log.info("[%d/%d] %s/%s: skipped (resume)", idx, total, cat, dork_id)
+                continue
             section(f"[{idx}/{total}] {cat}/{dork_id}: {query}")
-            results = search_engines_parallel(engines, query)
-            for engine_name, items in results.items():
+            sr = search_engines_parallel(engines, query)
+            engine_failures = set(sr.failed_engines)
+            if google and google.captcha_seen:
+                engine_failures.add("google")
+            for engine_name, items in sr.items.items():
                 hits = 0
                 dropped = 0
                 for item in items:
@@ -2027,9 +2175,20 @@ def cmd_dork(args) -> int:
                 else:
                     log.info("%s: 0 hits for %s/%s",
                              engine_name, cat, dork_id)
+            if engine_failures:
+                log.warning("dork %s/%s: not marking complete — "
+                            "engine(s) failed: %s",
+                            cat, dork_id, ", ".join(sorted(engine_failures)))
+            else:
+                completed_dorks.add(dork_id)
             atomic_write_json(findings_path, findings)
+            atomic_write_json(progress_path, {
+                "fingerprint": run_fingerprint,
+                "completed": sorted(completed_dorks),
+            })
             elapsed = time.time() - run_started
-            avg = elapsed / idx
+            done = idx - skipped
+            avg = elapsed / max(done, 1)
             remaining = avg * (total - idx)
             log.info("progress: %d/%d (%d%%) | elapsed %s | eta %s",
                      idx, total, int(idx * 100 / total),
@@ -2077,7 +2236,8 @@ def print_dork_summary(findings: list[dict],
 
 _HTML_CSS = """
 body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;
-     max-width:1200px;margin:2em auto;padding:0 1em;color:#222;line-height:1.5}
+     max-width:1200px;margin:2em auto;padding:0 1em;color:#222;line-height:1.5;
+     background:#fff}
 h1{border-bottom:3px solid #2563eb;padding-bottom:.3em;color:#1e3a8a}
 h2{margin-top:2em;color:#1e3a8a;border-bottom:1px solid #e5e7eb;padding-bottom:.2em}
 h3{color:#374151}
@@ -2098,6 +2258,11 @@ a:hover{text-decoration:underline}
      border-radius:3px;font-size:.8em;margin-right:.3em}
 .tag.danger{background:#fee2e2;color:#991b1b}
 .tag.engine{background:#f3f4f6;color:#4b5563}
+.tag.sev-critical{background:#fee2e2;color:#991b1b}
+.tag.sev-high{background:#ffedd5;color:#9a3412}
+.tag.sev-medium{background:#fef9c3;color:#854d0e}
+.tag.sev-low{background:#dbeafe;color:#1e3a8a}
+.tag.sev-info{background:#f3f4f6;color:#4b5563}
 details{margin:.5em 0}
 summary{cursor:pointer;padding:.5em;background:#f3f4f6;border-radius:3px;font-weight:600}
 summary:hover{background:#e5e7eb}
@@ -2105,6 +2270,79 @@ summary:hover{background:#e5e7eb}
 .url-cell{max-width:500px;word-break:break-all}
 .count{display:inline-block;min-width:2em;text-align:right;color:#1e3a8a;
        font-weight:600;font-family:ui-monospace,monospace}
+.cat-section{border-left:4px solid #e5e7eb;padding-left:1em;margin-bottom:2em}
+.cat-section.sev-critical{border-left-color:#dc2626}
+.cat-section.sev-high{border-left-color:#f97316}
+.cat-section.sev-medium{border-left-color:#eab308}
+.cat-section.sev-low{border-left-color:#3b82f6}
+.cat-section.sev-info{border-left-color:#6b7280}
+.stat-row{display:flex;gap:1em;margin:1em 0;flex-wrap:wrap}
+.stat-tile{padding:1em 1.5em;background:#f9fafb;border-radius:6px;text-align:center;
+           min-width:100px;border-top:3px solid #e5e7eb}
+.stat-tile .stat-num{font-size:2em;font-weight:700;color:#1e3a8a}
+.stat-tile .stat-label{font-size:.85em;color:#6b7280;text-transform:uppercase}
+.filter-bar{display:flex;gap:.8em;flex-wrap:wrap;align-items:center;
+            padding:1em;background:#f9fafb;border-radius:6px;margin:1em 0;
+            border:1px solid #e5e7eb}
+.filter-bar input[type=text]{padding:.4em .6em;border:1px solid #d1d5db;border-radius:4px;
+                             font-size:.9em;min-width:200px}
+.filter-bar select{padding:.4em .6em;border:1px solid #d1d5db;border-radius:4px;
+                   font-size:.9em;background:#fff}
+.filter-bar button{padding:.4em .8em;border:1px solid #d1d5db;border-radius:4px;
+                   font-size:.9em;background:#fff;cursor:pointer}
+.filter-bar button:hover{background:#e5e7eb}
+.filter-bar .filter-count{font-size:.85em;color:#6b7280}
+.btn-copy{padding:.2em .5em;border:1px solid #d1d5db;border-radius:3px;font-size:.75em;
+          background:#fff;cursor:pointer;color:#4b5563;margin-left:.5em}
+.btn-copy:hover{background:#e5e7eb}
+.multi-hit-count{font-weight:700;color:#dc2626}
+@media (prefers-color-scheme:dark){
+  body{background:#1a1a2e;color:#e0e0e0}
+  h1{color:#93b5f5;border-bottom-color:#3b82f6}
+  h2{color:#93b5f5;border-bottom-color:#374151}
+  h3{color:#d1d5db}
+  .meta{color:#9ca3af}
+  .kv dt{color:#d1d5db}
+  th{background:#1f2937}
+  td{border-bottom-color:#374151}
+  tr:hover td{background:#1f2937}
+  code,pre{background:#1f2937}
+  summary{background:#1f2937}
+  summary:hover{background:#374151}
+  a{color:#60a5fa}
+  .tag{background:#1e3a5f;color:#93c5fd}
+  .tag.danger,.tag.sev-critical{background:#7f1d1d;color:#fca5a5}
+  .tag.sev-high{background:#7c2d12;color:#fdba74}
+  .tag.sev-medium{background:#713f12;color:#fde68a}
+  .tag.sev-low{background:#1e3a5f;color:#93c5fd}
+  .tag.engine,.tag.sev-info{background:#374151;color:#d1d5db}
+  .snippet{color:#9ca3af}
+  .stat-tile{background:#1f2937;border-top-color:#374151}
+  .stat-tile .stat-num{color:#93b5f5}
+  .stat-tile .stat-label{color:#9ca3af}
+  .filter-bar{background:#1f2937;border-color:#374151}
+  .filter-bar input[type=text],.filter-bar select{background:#111827;color:#e0e0e0;
+    border-color:#374151}
+  .filter-bar button,.btn-copy{background:#1f2937;color:#d1d5db;border-color:#374151}
+  .filter-bar button:hover,.btn-copy:hover{background:#374151}
+  .count{color:#93b5f5}
+  .cat-section{border-left-color:#374151}
+  .cat-section.sev-critical{border-left-color:#ef4444}
+  .cat-section.sev-high{border-left-color:#fb923c}
+  .cat-section.sev-medium{border-left-color:#facc15}
+  .cat-section.sev-low{border-left-color:#60a5fa}
+  .cat-section.sev-info{border-left-color:#6b7280}
+}
+@media print{
+  body{color:#000;max-width:none;background:#fff}
+  a{text-decoration:underline;color:#000}
+  .tag{border:1px solid #999;background:#f0f0f0;color:#000}
+  summary{background:#eee}
+  details{break-inside:avoid}
+  .filter-bar,.btn-copy{display:none}
+  .cat-section{border-left-width:3px}
+  .stat-tile{border:1px solid #ccc}
+}
 """
 
 
@@ -2194,7 +2432,7 @@ def render_metadata_report(metadata: list[dict], domain: str,
         company = next((v for k, v in exif.items()
                         if k.endswith("Company") and v), "") or ""
         producer = next((v for k, v in exif.items()
-                         if k.endswith("Producer") or k.endswith("Application")
+                         if (k.endswith("Producer") or k.endswith("Application"))
                          and v), "") or ""
         size_kb = (m.get("size") or 0) // 1024
         url = m.get("url", "")
@@ -2224,6 +2462,30 @@ def render_dork_report(findings: list[dict], domain: str,
     for c, _d, _q in all_dorks:
         cat_dorks_total[c] += 1
 
+    sev_counts: Counter = Counter()
+    for f in findings:
+        sev_counts[CATEGORY_SEVERITY.get(f["category"], "info")] += 1
+
+    unique_hosts: set[str] = set()
+    engine_counts: Counter = Counter()
+    for f in findings:
+        host = up.urlsplit(f.get("url", "")).hostname or ""
+        if host:
+            unique_hosts.add(host)
+        engine_counts[f.get("engine", "?")] += 1
+
+    url_dorks: dict[str, set[str]] = defaultdict(set)
+    for f in findings:
+        url_dorks[f["url"]].add(f["dork_id"])
+    multi_hit = {u: dids for u, dids in url_dorks.items() if len(dids) > 1}
+
+    hit_dork_ids = {f["dork_id"] for f in findings}
+    zero_hit = [(c, d, q) for c, d, q in all_dorks if d not in hit_dork_ids]
+
+    def _cat_sort_key(c: str) -> tuple:
+        sev = CATEGORY_SEVERITY.get(c, "info")
+        return (_SEV_ORDER.get(sev, 4), -len(by_cat.get(c, [])))
+
     parts: list[str] = []
     parts.append(f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
                  f"<title>Dork report — {_esc(domain)}</title>"
@@ -2235,23 +2497,78 @@ def render_dork_report(findings: list[dict], domain: str,
                  f"{len(by_cat)} categories · "
                  f"{len(all_dorks)} dorks executed</p>")
 
+    # --- executive summary ---
+    if findings:
+        parts.append("<h2>Executive Summary</h2>")
+        parts.append("<div class='stat-row'>")
+        for sev_label, color in [("Critical", "#dc2626"), ("High", "#f97316"),
+                                  ("Medium", "#eab308"), ("Low", "#3b82f6"),
+                                  ("Info", "#6b7280")]:
+            count = sev_counts.get(sev_label.lower(), 0)
+            parts.append(
+                f"<div class='stat-tile' style='border-top-color:{color}'>"
+                f"<div class='stat-num'>{count}</div>"
+                f"<div class='stat-label'>{sev_label}</div></div>")
+        parts.append("</div>")
+        parts.append("<div class='stat-row'>")
+        parts.append(f"<div class='stat-tile'><div class='stat-num'>"
+                     f"{len(unique_hosts)}</div>"
+                     f"<div class='stat-label'>Unique Hosts</div></div>")
+        parts.append(f"<div class='stat-tile'><div class='stat-num'>"
+                     f"{len(multi_hit)}</div>"
+                     f"<div class='stat-label'>Multi-Dork URLs</div></div>")
+        for eng, cnt in engine_counts.most_common():
+            parts.append(f"<div class='stat-tile'><div class='stat-num'>"
+                         f"{cnt}</div>"
+                         f"<div class='stat-label'>{_esc(eng)}</div></div>")
+        parts.append("</div>")
+
+    # --- filter bar ---
+    if findings:
+        cats_json = json.dumps(sorted(by_cat.keys(), key=_cat_sort_key))
+        parts.append(
+            "<div class='filter-bar' id='filterBar'>"
+            "<input type='text' id='filterText' placeholder='Search URLs, titles, snippets...'>"
+            f"<select id='filterCat'><option value=''>All categories</option></select>"
+            "<select id='filterSev'><option value=''>All severities</option>"
+            "<option value='critical'>Critical</option>"
+            "<option value='high'>High</option>"
+            "<option value='medium'>Medium</option>"
+            "<option value='low'>Low</option>"
+            "<option value='info'>Info</option></select>"
+            "<select id='filterEngine'><option value=''>All engines</option>"
+            "<option value='ddg'>DDG</option>"
+            "<option value='google'>Google</option></select>"
+            "<button onclick='clearFilters()'>Clear</button>"
+            "<button onclick='copyVisibleUrls()'>Copy Visible URLs</button>"
+            "<span class='filter-count' id='filterCount'></span>"
+            "</div>")
+
+    # --- summary by category ---
     parts.append("<h2>Summary by category</h2><table><thead><tr>"
-                 "<th>Category</th><th style='width:100px'>Findings</th>"
+                 "<th>Category</th><th style='width:100px'>Severity</th>"
+                 "<th style='width:100px'>Findings</th>"
                  "<th style='width:100px'>Dorks</th></tr></thead><tbody>")
-    for cat in sorted(by_cat.keys(),
-                      key=lambda c: -len(by_cat[c])):
+    for cat in sorted(by_cat.keys(), key=_cat_sort_key):
+        sev = CATEGORY_SEVERITY.get(cat, "info")
         parts.append(
             f"<tr><td><strong>{_esc(cat)}</strong></td>"
+            f"<td><span class='tag sev-{sev}'>{sev}</span></td>"
             f"<td><span class='count'>{len(by_cat[cat])}</span></td>"
             f"<td>{cat_dorks_total[cat]}</td></tr>"
         )
     parts.append("</tbody></table>")
 
-    for cat in sorted(by_cat.keys(),
-                      key=lambda c: -len(by_cat[c])):
-        parts.append(f"<h2>{_esc(cat)} "
-                     f"<span class='meta'>({len(by_cat[cat])} findings)</span></h2>")
-        # group by dork_id within category
+    # --- per-category findings ---
+    for cat in sorted(by_cat.keys(), key=_cat_sort_key):
+        sev = CATEGORY_SEVERITY.get(cat, "info")
+        parts.append(
+            f"<div class='cat-section sev-{sev}' data-category='{_esc(cat)}' "
+            f"data-severity='{sev}'>")
+        parts.append(
+            f"<h2>{_esc(cat)} "
+            f"<span class='tag sev-{sev}'>{sev}</span> "
+            f"<span class='meta'>({len(by_cat[cat])} findings)</span></h2>")
         by_dork: dict[str, list[dict]] = defaultdict(list)
         for f in by_cat[cat]:
             by_dork[f["dork_id"]].append(f)
@@ -2271,7 +2588,10 @@ def render_dork_report(findings: list[dict], domain: str,
                 url = it.get("url", "")
                 engine = it.get("engine", "")
                 parts.append(
-                    f"<tr><td class='url-cell'>"
+                    f"<tr class='finding-row' data-category='{_esc(cat)}' "
+                    f"data-severity='{sev}' data-engine='{_esc(engine)}' "
+                    f"data-url='{_esc(url)}'>"
+                    f"<td class='url-cell'>"
                     f"<a href='{_esc(url)}' target='_blank' "
                     f"rel='noopener'><strong>{_esc(title) if title else _esc(url)}"
                     f"</strong></a><br>"
@@ -2281,10 +2601,104 @@ def render_dork_report(findings: list[dict], domain: str,
                     f"</td><td><span class='tag engine'>{_esc(engine)}</span></td></tr>"
                 )
             parts.append("</tbody></table></details>")
+        parts.append("</div>")
+
+    # --- multi-dork URLs ---
+    if multi_hit:
+        parts.append(f"<h2>URLs flagged by multiple dorks "
+                     f"<span class='meta'>({len(multi_hit)})</span></h2>")
+        parts.append("<table><thead><tr><th>URL</th>"
+                     "<th style='width:80px'>Dorks</th>"
+                     "<th>Matched By</th></tr></thead><tbody>")
+        for url, dork_ids in sorted(multi_hit.items(),
+                                    key=lambda x: -len(x[1])):
+            parts.append(
+                f"<tr><td class='url-cell'><a href='{_esc(url)}' target='_blank' "
+                f"rel='noopener'>{_esc(url)}</a></td>"
+                f"<td><span class='multi-hit-count'>{len(dork_ids)}</span></td>"
+                f"<td>{', '.join(_esc(d) for d in sorted(dork_ids))}</td></tr>")
+        parts.append("</tbody></table>")
+
+    # --- zero-hit dorks ---
+    if zero_hit:
+        parts.append(f"<details><summary>Dorks with 0 results "
+                     f"<span class='count'>{len(zero_hit)}</span></summary>")
+        parts.append("<table><thead><tr><th>Category</th><th>Dork ID</th>"
+                     "<th>Query</th></tr></thead><tbody>")
+        for c, d, q in zero_hit:
+            parts.append(f"<tr><td>{_esc(c)}</td><td>{_esc(d)}</td>"
+                         f"<td><code>{_esc(q)}</code></td></tr>")
+        parts.append("</tbody></table></details>")
 
     if not findings:
         parts.append("<p>No findings. Try broader categories or "
                      "verify search engines are reaching the target.</p>")
+
+    # --- inline JavaScript for filtering ---
+    parts.append("""<script>
+(function(){
+  var rows=document.querySelectorAll('.finding-row');
+  var sections=document.querySelectorAll('.cat-section');
+  var tF=document.getElementById('filterText');
+  var fC=document.getElementById('filterCat');
+  var fS=document.getElementById('filterSev');
+  var fE=document.getElementById('filterEngine');
+  var fCount=document.getElementById('filterCount');
+  if(!tF)return;
+  var cats=new Set();
+  sections.forEach(function(s){cats.add(s.dataset.category)});
+  cats.forEach(function(c){
+    var o=document.createElement('option');o.value=c;o.textContent=c;fC.appendChild(o);
+  });
+  function applyFilters(){
+    var text=(tF.value||'').toLowerCase();
+    var cat=fC.value;var sev=fS.value;var eng=fE.value;
+    var visible=0;
+    rows.forEach(function(r){
+      var show=true;
+      if(cat&&r.dataset.category!==cat)show=false;
+      if(sev&&r.dataset.severity!==sev)show=false;
+      if(eng&&r.dataset.engine!==eng)show=false;
+      if(text&&r.textContent.toLowerCase().indexOf(text)<0)show=false;
+      r.style.display=show?'':'none';
+      if(show)visible++;
+    });
+    sections.forEach(function(s){
+      var any=false;
+      s.querySelectorAll('.finding-row').forEach(function(r){
+        if(r.style.display!=='none')any=true;
+      });
+      s.style.display=any?'':'none';
+    });
+    fCount.textContent=visible+'/'+rows.length+' findings';
+  }
+  tF.addEventListener('input',applyFilters);
+  fC.addEventListener('change',applyFilters);
+  fS.addEventListener('change',applyFilters);
+  fE.addEventListener('change',applyFilters);
+  applyFilters();
+  window.clearFilters=function(){tF.value='';fC.value='';fS.value='';fE.value='';applyFilters()};
+  window.copyVisibleUrls=function(){
+    var urls=[];
+    rows.forEach(function(r){if(r.style.display!=='none')urls.push(r.dataset.url)});
+    var unique=[...new Set(urls)];
+    var text=unique.join('\\n');
+    function fallback(){
+      var ta=document.createElement('textarea');
+      ta.value=text;ta.style.position='fixed';ta.style.opacity='0';
+      document.body.appendChild(ta);ta.select();
+      try{document.execCommand('copy');alert('Copied '+unique.length+' URLs')}
+      catch(e){alert('Copy failed — select and copy manually:\\n'+text)}
+      document.body.removeChild(ta);
+    }
+    if(navigator.clipboard&&window.isSecureContext){
+      navigator.clipboard.writeText(text).then(function(){
+        alert('Copied '+unique.length+' URLs');
+      },fallback);
+    }else{fallback()}
+  };
+})();
+</script>""")
 
     parts.append("</body></html>")
     out = target_dir / "report.html"

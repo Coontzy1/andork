@@ -1420,7 +1420,7 @@ def parse_args():
     pm.add_argument("--max-size-mb", type=int, default=50)
     pm.add_argument("--download-all", action="store_true",
                     help="Download all search results regardless of scope "
-                         "(skip in_scope filtering)")
+                         "or extension (skip in_scope and filetype filtering)")
     pm.add_argument("--resume", dest="resume",
                     action="store_true", default=True)
     pm.add_argument("--no-resume", dest="resume", action="store_false")
@@ -1714,8 +1714,8 @@ def cmd_metadata(args) -> int:
                 sd, dd, args.max_pages, args.max_per_dork,
             )
             if args.download_all:
-                log.warning("%s--download-all: scope filtering disabled — "
-                            "downloading ALL search results regardless of host%s",
+                log.warning("%s--download-all: scope and extension filtering "
+                            "disabled — downloading ALL search results%s",
                             C.YELLOW, C.RESET)
             log.info("extensions: %s", ",".join(exts))
 
@@ -1748,7 +1748,7 @@ def cmd_metadata(args) -> int:
                         host = up.urlsplit(raw).hostname or ""
                         if not args.download_all and not in_scope(host, domain):
                             continue
-                        if extract_ext(raw) != ext:
+                        if not args.download_all and extract_ext(raw) != ext:
                             continue
                         nu = normalize_url(raw)
                         if args.show_urls:

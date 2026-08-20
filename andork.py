@@ -607,6 +607,7 @@ BROWSER_CANDIDATES = (
 DRIVER_CANDIDATES = (
     "/usr/bin/chromedriver",
     "/usr/local/bin/chromedriver",
+    "/snap/bin/chromium.chromedriver",
 )
 
 
@@ -1293,8 +1294,12 @@ def print_metadata_summary(metadata: list[dict]) -> None:
 # --------------------------- argparse ---------------------------
 
 def _add_common_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("-d", "--domain", required=True,
-                   help="Target domain (subdomains auto-included)")
+    p.add_argument("-d", "--domain", default=None,
+                   help="Target domain(s), comma-separated "
+                        "(subdomains auto-included)")
+    p.add_argument("--domain-file", default=None,
+                   help="Path to file with one domain per line "
+                        "(blank lines and #comments ignored)")
     p.add_argument("-o", "--output", default="./output")
     p.add_argument("--max-per-dork", type=int, default=100,
                    help="Max URLs to keep per dork (per engine)")
@@ -1339,6 +1344,8 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--skip-preflight", action="store_true",
                    help="Skip startup preflight checks (deps, browser, "
                         "exiftool, root). For unusual environments only.")
+    p.add_argument("--show-urls", action="store_true",
+                   help="Print each discovered URL to console as it is found")
 
 
 def parse_args():
@@ -1358,6 +1365,10 @@ def parse_args():
         "\n"
         "  # unattended DDG-only run (no Chrome, no CAPTCHA risk, weaker results)\n"
         "  andork dork -d domain.com --no-google\n"
+        "\n"
+        "  # multiple domains (comma-separated or from file)\n"
+        "  andork dork -d domain1.com,domain2.com --no-google\n"
+        "  andork metadata --domain-file targets.txt --headed --allow-root\n"
         "\n"
         "see 'andork metadata --help' or 'andork dork --help' for per-mode flags."
     )
@@ -1407,6 +1418,9 @@ def parse_args():
     pm.add_argument("--download-delay", type=int, default=30,
                     help=f"Seconds between downloads (min {MIN_DOWNLOAD_DELAY})")
     pm.add_argument("--max-size-mb", type=int, default=50)
+    pm.add_argument("--download-all", action="store_true",
+                    help="Download all search results regardless of scope "
+                         "(skip in_scope filtering)")
     pm.add_argument("--resume", dest="resume",
                     action="store_true", default=True)
     pm.add_argument("--no-resume", dest="resume", action="store_false")
@@ -1594,6 +1608,35 @@ def validate_domain(d: str) -> str:
     return d.lower()
 
 
+def resolve_domains(args) -> list[str]:
+    domains: list[str] = []
+    if args.domain:
+        for d in args.domain.split(","):
+            d = d.strip()
+            if d:
+                domains.append(validate_domain(d))
+    if args.domain_file:
+        p = Path(args.domain_file).expanduser()
+        if not p.exists():
+            raise SystemExit(f"domain file not found: {p}")
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            domains.append(validate_domain(s))
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for d in domains:
+        if d not in seen:
+            seen.add(d)
+            deduped.append(d)
+    if not deduped:
+        raise SystemExit(
+            "no domains specified — use -d DOMAIN or --domain-file FILE"
+        )
+    return deduped
+
+
 def setup_logging(target_dir: Path) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
     log.setLevel(logging.INFO)
@@ -1613,149 +1656,165 @@ def setup_logging(target_dir: Path) -> None:
 
 
 def cmd_metadata(args) -> int:
-    args.domain = validate_domain(args.domain)
+    domains = resolve_domains(args)
     if args.max_pages is None:
         args.max_pages = 5
 
     sd = max(args.search_delay, MIN_SEARCH_DELAY)
     dd = max(args.download_delay, MIN_DOWNLOAD_DELAY)
 
-    target_dir = Path(args.output) / args.domain / "metadata"
-    files_dir = target_dir / "files"
-    debug_dir = target_dir / "debug"
-    files_dir.mkdir(parents=True, exist_ok=True)
-    setup_logging(target_dir)
-
-    log.info("=== metadata mode: domain=%s ===", args.domain)
-    log.info(
-        "search_delay=%ds download_delay=%ds max_pages=%d max_per_dork=%d",
-        sd, dd, args.max_pages, args.max_per_dork,
-    )
-
     if args.exts:
         exts = [e.strip().lower().lstrip(".")
                 for e in args.exts.split(",") if e.strip()]
     else:
         exts = list(EXT_PRESETS[args.ext_preset])
-        log.info("ext-preset: %s", args.ext_preset)
     if not exts:
         raise SystemExit("no extensions specified")
-    log.info("extensions: %s", ",".join(exts))
 
-    # Each engine gets its OWN rate limiter, so DDG and Google can run
-    # concurrently per dork. Only sequential within a given engine.
     gd = max(args.google_delay or sd, MIN_SEARCH_DELAY)
     ddg_rate = RateLimiter(sd, "ddg")
     google_rate = RateLimiter(gd, "google")
     download_rate = RateLimiter(dd, "download")
 
-    state_path = target_dir / "search_results.json"
-    state: dict = {"urls": {}, "downloads": {}}
-    if state_path.exists() and args.resume:
-        try:
-            state = json.loads(state_path.read_text())
-            state.setdefault("urls", {})
-            state.setdefault("downloads", {})
-            log.info(
-                "resumed: %d known URLs, %d downloads",
-                len(state["urls"]), len(state["downloads"]),
-            )
-        except Exception as e:
-            log.warning("could not load state, starting fresh: %s", e)
-
     import requests
     sess_dl = requests.Session()
 
     ddg = (None if args.no_ddg
-           else DDGSearch(ddg_rate, args.max_per_dork, debug_dir))
+           else DDGSearch(ddg_rate, args.max_per_dork, None))
     google = (None if args.no_google
               else GoogleSelenium(google_rate, args.max_pages,
                                   args.headed, args.proxy,
                                   args.browser_path, args.driver_path,
-                                  debug_dir, args.user_data_dir,
+                                  None, args.user_data_dir,
                                   args.captcha_timeout,
                                   args.wait_for_captcha))
     engines = [(n, e) for n, e in (("ddg", ddg), ("google", google)) if e]
 
     try:
-        for ext in exts:
-            dork = f"site:{args.domain} filetype:{ext}"
-            section(f"DORK: {dork}")
-            sr = search_engines_parallel(engines, dork)
-            for engine_name, items in sr.items.items():
-                bucket = 0
-                for item in items:
-                    if bucket >= args.max_per_dork:
-                        break
-                    raw = item["href"] if isinstance(item, dict) else item
-                    if not raw or not raw.startswith(("http://", "https://")):
-                        continue
-                    host = up.urlsplit(raw).hostname or ""
-                    if not in_scope(host, args.domain):
-                        continue
-                    if extract_ext(raw) != ext:
-                        continue
-                    nu = normalize_url(raw)
-                    rec = state["urls"].setdefault(nu, {
-                        "engines": [],
-                        "ext": ext,
-                        "first_seen": datetime.now(timezone.utc).isoformat(),
-                    })
-                    if engine_name not in rec["engines"]:
-                        rec["engines"].append(engine_name)
-                    bucket += 1
-                if bucket:
-                    log.info("%s%s: %d in-scope %s URLs%s",
-                             C.GREEN, engine_name, bucket, ext, C.RESET)
-                else:
-                    log.info("%s: 0 in-scope %s URLs", engine_name, ext)
-            atomic_write_json(state_path, state)
+        for di, domain in enumerate(domains, start=1):
+            if len(domains) > 1:
+                section(f"DOMAIN: {domain} ({di}/{len(domains)})")
+            if google:
+                google.captcha_seen = False
+
+            target_dir = Path(args.output) / domain / "metadata"
+            files_dir = target_dir / "files"
+            debug_dir = target_dir / "debug"
+            files_dir.mkdir(parents=True, exist_ok=True)
+            setup_logging(target_dir)
+
+            if ddg:
+                ddg.debug_dir = debug_dir
+            if google:
+                google.debug_dir = debug_dir
+
+            log.info("=== metadata mode: domain=%s ===", domain)
+            log.info(
+                "search_delay=%ds download_delay=%ds max_pages=%d max_per_dork=%d",
+                sd, dd, args.max_pages, args.max_per_dork,
+            )
+            if args.download_all:
+                log.warning("%s--download-all: scope filtering disabled — "
+                            "downloading ALL search results regardless of host%s",
+                            C.YELLOW, C.RESET)
+            log.info("extensions: %s", ",".join(exts))
+
+            state_path = target_dir / "search_results.json"
+            state: dict = {"urls": {}, "downloads": {}}
+            if state_path.exists() and args.resume:
+                try:
+                    state = json.loads(state_path.read_text())
+                    state.setdefault("urls", {})
+                    state.setdefault("downloads", {})
+                    log.info(
+                        "resumed: %d known URLs, %d downloads",
+                        len(state["urls"]), len(state["downloads"]),
+                    )
+                except Exception as e:
+                    log.warning("could not load state, starting fresh: %s", e)
+
+            for ext in exts:
+                dork = f"site:{domain} filetype:{ext}"
+                section(f"DORK: {dork}")
+                sr = search_engines_parallel(engines, dork)
+                for engine_name, items in sr.items.items():
+                    bucket = 0
+                    for item in items:
+                        if bucket >= args.max_per_dork:
+                            break
+                        raw = item["href"] if isinstance(item, dict) else item
+                        if not raw or not raw.startswith(("http://", "https://")):
+                            continue
+                        host = up.urlsplit(raw).hostname or ""
+                        if not args.download_all and not in_scope(host, domain):
+                            continue
+                        if extract_ext(raw) != ext:
+                            continue
+                        nu = normalize_url(raw)
+                        if args.show_urls:
+                            log.info("  %s-> %s%s", C.CYAN, nu, C.RESET)
+                        rec = state["urls"].setdefault(nu, {
+                            "engines": [],
+                            "ext": ext,
+                            "first_seen": datetime.now(timezone.utc).isoformat(),
+                        })
+                        if engine_name not in rec["engines"]:
+                            rec["engines"].append(engine_name)
+                        bucket += 1
+                    scope_label = "total" if args.download_all else "in-scope"
+                    if bucket:
+                        log.info("%s%s: %d %s %s URLs%s",
+                                 C.GREEN, engine_name, bucket, scope_label, ext, C.RESET)
+                    else:
+                        log.info("%s: 0 %s %s URLs", engine_name, scope_label, ext)
+                atomic_write_json(state_path, state)
+
+            log.info("=== download phase: %d unique URLs ===", len(state["urls"]))
+            url_to_sha = {rec["url"]: sha
+                          for sha, rec in state["downloads"].items()}
+            for nu, meta in list(state["urls"].items()):
+                ext = meta["ext"]
+                existing = url_to_sha.get(nu)
+                if existing and (files_dir / f"{existing}.{ext}").exists() and args.resume:
+                    continue
+                download_rate.wait()
+                ua = args.user_agent or DEFAULT_UA
+                rec = download_one(
+                    sess_dl, nu, ext, files_dir, args.max_size_mb, ua, args.proxy,
+                )
+                if rec:
+                    rec.engines = list(meta["engines"])
+                    state["downloads"][rec.sha1] = asdict(rec)
+                    url_to_sha[nu] = rec.sha1
+                    atomic_write_json(state_path, state)
+                    log.info("%sdownloaded %s -> %s.%s (%d bytes)%s",
+                             C.GREEN, nu, rec.sha1[:12], ext, rec.size, C.RESET)
+
+            log.info("=== exiftool phase ===")
+            by_ext: dict[str, list[tuple[str, Path]]] = defaultdict(list)
+            for sha, rec in state["downloads"].items():
+                path = files_dir / f"{sha}.{rec['ext']}"
+                if path.exists():
+                    by_ext[rec["ext"]].append((sha, path))
+
+            metadata: list[dict] = []
+            for ext, items in by_ext.items():
+                log.info("exiftool: %d %s files", len(items), ext)
+                exif = run_exiftool([p for _, p in items])
+                for sha, p in items:
+                    rec = state["downloads"][sha]
+                    metadata.append({**rec, "exif": exif.get(sha, {})})
+
+            atomic_write_json(target_dir / "metadata.json", metadata)
+            log.info("wrote metadata.json: %d entries", len(metadata))
+
+            print_metadata_summary(metadata)
+            render_metadata_report(metadata, domain, target_dir)
+            section(f"done: {domain}")
     finally:
         if google:
             google.close()
 
-    log.info("=== download phase: %d unique URLs ===", len(state["urls"]))
-    url_to_sha = {rec["url"]: sha
-                  for sha, rec in state["downloads"].items()}
-    for nu, meta in list(state["urls"].items()):
-        ext = meta["ext"]
-        existing = url_to_sha.get(nu)
-        if existing and (files_dir / f"{existing}.{ext}").exists() and args.resume:
-            continue
-        download_rate.wait()
-        ua = args.user_agent or DEFAULT_UA
-        rec = download_one(
-            sess_dl, nu, ext, files_dir, args.max_size_mb, ua, args.proxy,
-        )
-        if rec:
-            rec.engines = list(meta["engines"])
-            state["downloads"][rec.sha1] = asdict(rec)
-            url_to_sha[nu] = rec.sha1
-            atomic_write_json(state_path, state)
-            log.info("%sdownloaded %s -> %s.%s (%d bytes)%s",
-                     C.GREEN, nu, rec.sha1[:12], ext, rec.size, C.RESET)
-
-    log.info("=== exiftool phase ===")
-    by_ext: dict[str, list[tuple[str, Path]]] = defaultdict(list)
-    for sha, rec in state["downloads"].items():
-        path = files_dir / f"{sha}.{rec['ext']}"
-        if path.exists():
-            by_ext[rec["ext"]].append((sha, path))
-
-    metadata: list[dict] = []
-    for ext, items in by_ext.items():
-        log.info("exiftool: %d %s files", len(items), ext)
-        exif = run_exiftool([p for _, p in items])
-        for sha, p in items:
-            rec = state["downloads"][sha]
-            metadata.append({**rec, "exif": exif.get(sha, {})})
-
-    atomic_write_json(target_dir / "metadata.json", metadata)
-    log.info("wrote metadata.json: %d entries", len(metadata))
-
-    print_metadata_summary(metadata)
-    render_metadata_report(metadata, args.domain, target_dir)
-    section("done")
     return 0
 
 
@@ -2020,190 +2079,226 @@ def validate_dork_match(query: str, url: str,
 
 
 def cmd_dork(args) -> int:
-    args.domain = validate_domain(args.domain)
-    source_label = "curated"
-    if args.dork_file:
-        dorks = _load_dork_file(args.dork_file, args.domain)
-        categories = sorted({c for c, _, _ in dorks})
-        source_label = f"file:{args.dork_file}"
-    else:
-        categories = _resolve_categories(args.categories)
-        # Flatten the curated dorks we'll run.
-        dorks: list[tuple[str, str, str]] = []  # (category, dork_id, query)
-        for cat in categories:
-            for dork_id, template in DORKS_DB[cat]:
-                dorks.append(
-                    (cat, dork_id, _build_dork_query(template, args.domain))
-                )
-
-    if args.list_dorks:
-        for cat, dork_id, q in dorks:
-            print(f"{cat:10s}  {dork_id:22s}  {q}")
-        print(f"\n{len(dorks)} dorks across {len(categories)} categories "
-              f"(source={source_label})")
-        return 0
-
-    sd = max(args.search_delay, MIN_SEARCH_DELAY)
-    target_dir = Path(args.output) / args.domain / "dork"
-    debug_dir = target_dir / "debug"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    setup_logging(target_dir)
-
+    domains = resolve_domains(args)
     if args.max_pages is None:
         args.max_pages = 3 if args.dork_file else 1
 
-    log.info("=== dork mode: domain=%s ===", args.domain)
-    log.info("source=%s | categories=%s | %d dorks total | "
-             "search_delay=%ds | google_pages=%d",
-             source_label, ",".join(categories), len(dorks), sd, args.max_pages)
+    sd = max(args.search_delay, MIN_SEARCH_DELAY)
+    strict = not args.no_strict
 
     gd = max(args.google_delay or sd, MIN_SEARCH_DELAY)
     ddg_rate = RateLimiter(sd, "ddg")
     google_rate = RateLimiter(gd, "google")
 
     ddg = (None if args.no_ddg
-           else DDGSearch(ddg_rate, args.max_per_dork, debug_dir))
+           else DDGSearch(ddg_rate, args.max_per_dork, None))
     google = (None if args.no_google
               else GoogleSelenium(google_rate, args.max_pages,
                                   args.headed, args.proxy,
                                   args.browser_path, args.driver_path,
-                                  debug_dir, args.user_data_dir,
+                                  None, args.user_data_dir,
                                   args.captcha_timeout,
                                   args.wait_for_captcha))
     engines = [(n, e) for n, e in (("ddg", ddg), ("google", google)) if e]
 
-    findings_path = target_dir / "findings.json"
-    progress_path = target_dir / "progress.json"
-    findings: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    completed_dorks: set[str] = set()
+    # --list-dorks: show dorks for first domain and exit
+    if args.list_dorks:
+        domain = domains[0]
+        source_label = "curated"
+        if args.dork_file:
+            dorks = _load_dork_file(args.dork_file, domain)
+            categories = sorted({c for c, _, _ in dorks})
+            source_label = f"file:{args.dork_file}"
+        else:
+            categories = _resolve_categories(args.categories)
+            dorks: list[tuple[str, str, str]] = []
+            for cat in categories:
+                for dork_id, template in DORKS_DB[cat]:
+                    dorks.append(
+                        (cat, dork_id, _build_dork_query(template, domain))
+                    )
+        for cat, dork_id, q in dorks:
+            print(f"{cat:10s}  {dork_id:22s}  {q}")
+        print(f"\n{len(dorks)} dorks across {len(categories)} categories "
+              f"(source={source_label})")
+        if len(domains) > 1:
+            print(f"(showing dorks for {domain}; "
+                  f"{len(domains) - 1} more domain(s) will use the same set)")
+        return 0
 
-    run_fingerprint = hashlib.sha256(json.dumps({
-        "domain": args.domain,
-        "source": source_label,
-        "dorks": [(c, d, q) for c, d, q in dorks],
-        "engines": [n for n, _ in engines],
-        "strict": strict,
-        "max_pages": args.max_pages,
-        "max_per_dork": args.max_per_dork,
-    }, sort_keys=True).encode()).hexdigest()[:16]
-
-    if args.resume and progress_path.exists():
-        try:
-            progress = json.loads(progress_path.read_text())
-            if isinstance(progress, dict) and progress.get("fingerprint") == run_fingerprint:
-                completed_dorks = set(progress.get("completed", []))
-                log.info("resumed: %d completed dorks (fingerprint match)",
-                         len(completed_dorks))
-            elif isinstance(progress, dict):
-                log.warning("progress fingerprint mismatch — previous run "
-                            "used different config; starting fresh")
-            else:
-                log.warning("progress file has old format; starting fresh")
-        except Exception as e:
-            log.warning("could not load progress for resume: %s", e)
-
-    if args.resume and completed_dorks and findings_path.exists():
-        try:
-            prev_findings = json.loads(findings_path.read_text())
-            for f in prev_findings:
-                if f.get("dork_id") in completed_dorks:
-                    findings.append(f)
-                    seen.add((f["dork_id"], f["url"]))
-            log.info("resumed: %d findings from completed dorks", len(findings))
-        except Exception as e:
-            log.warning("could not load findings for resume: %s", e)
-            findings = []
-
-    strict = not args.no_strict
-    total_dropped = 0
-    total = len(dorks)
-    skipped = 0
-    run_started = time.time()
     try:
-        for idx, (cat, dork_id, query) in enumerate(dorks, start=1):
-            if dork_id in completed_dorks:
-                skipped += 1
-                log.info("[%d/%d] %s/%s: skipped (resume)", idx, total, cat, dork_id)
-                continue
-            section(f"[{idx}/{total}] {cat}/{dork_id}: {query}")
-            sr = search_engines_parallel(engines, query)
-            engine_failures = set(sr.failed_engines)
-            if google and google.captcha_seen:
-                engine_failures.add("google")
-            for engine_name, items in sr.items.items():
-                hits = 0
-                dropped = 0
-                for item in items:
-                    if hits >= args.max_per_dork:
-                        break
-                    href = (item.get("href") if isinstance(item, dict)
-                            else item) or ""
-                    if not href.startswith(("http://", "https://")):
-                        continue
-                    nu = normalize_url(href)
-                    key = (dork_id, nu)
-                    if key in seen:
-                        continue
-                    if strict and is_noise_host(nu):
-                        dropped += 1
-                        continue
-                    title = item.get("title", "") if isinstance(item, dict) else ""
-                    snippet = item.get("body", "") if isinstance(item, dict) else ""
-                    if strict and not validate_dork_match(query, nu, title, snippet):
-                        dropped += 1
-                        continue
-                    seen.add(key)
-                    findings.append({
-                        "category": cat,
-                        "dork_id": dork_id,
-                        "dork_query": query,
-                        "url": nu,
-                        "title": title,
-                        "snippet": snippet,
-                        "engine": engine_name,
-                        "found_at": datetime.now(timezone.utc).isoformat(),
-                    })
-                    hits += 1
-                if dropped:
-                    total_dropped += dropped
-                    log.info("%s%s: dropped %d false-positive(s) for %s/%s%s",
-                             C.YELLOW, engine_name, dropped, cat, dork_id, C.RESET)
-                if hits:
-                    log.info("%s%s: %d hits for %s/%s%s",
-                             C.GREEN, engine_name, hits, cat, dork_id, C.RESET)
-                else:
-                    log.info("%s: 0 hits for %s/%s",
-                             engine_name, cat, dork_id)
-            if engine_failures:
-                log.warning("dork %s/%s: not marking complete — "
-                            "engine(s) failed: %s",
-                            cat, dork_id, ", ".join(sorted(engine_failures)))
+        for di, domain in enumerate(domains, start=1):
+            if len(domains) > 1:
+                section(f"DOMAIN: {domain} ({di}/{len(domains)})")
+            if google:
+                google.captcha_seen = False
+
+            source_label = "curated"
+            if args.dork_file:
+                dorks = _load_dork_file(args.dork_file, domain)
+                categories = sorted({c for c, _, _ in dorks})
+                source_label = f"file:{args.dork_file}"
             else:
-                completed_dorks.add(dork_id)
-            atomic_write_json(findings_path, findings)
-            atomic_write_json(progress_path, {
-                "fingerprint": run_fingerprint,
-                "completed": sorted(completed_dorks),
-            })
-            elapsed = time.time() - run_started
-            done = idx - skipped
-            avg = elapsed / max(done, 1)
-            remaining = avg * (total - idx)
-            log.info("progress: %d/%d (%d%%) | elapsed %s | eta %s",
-                     idx, total, int(idx * 100 / total),
-                     _fmt_dur(elapsed), _fmt_dur(remaining))
+                categories = _resolve_categories(args.categories)
+                dorks: list[tuple[str, str, str]] = []
+                for cat in categories:
+                    for dork_id, template in DORKS_DB[cat]:
+                        dorks.append(
+                            (cat, dork_id, _build_dork_query(template, domain))
+                        )
+
+            target_dir = Path(args.output) / domain / "dork"
+            debug_dir = target_dir / "debug"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            setup_logging(target_dir)
+
+            if ddg:
+                ddg.debug_dir = debug_dir
+            if google:
+                google.debug_dir = debug_dir
+
+            log.info("=== dork mode: domain=%s ===", domain)
+            log.info("source=%s | categories=%s | %d dorks total | "
+                     "search_delay=%ds | google_pages=%d",
+                     source_label, ",".join(categories), len(dorks), sd, args.max_pages)
+
+            findings_path = target_dir / "findings.json"
+            progress_path = target_dir / "progress.json"
+            findings: list[dict] = []
+            seen: set[tuple[str, str]] = set()
+            completed_dorks: set[str] = set()
+
+            run_fingerprint = hashlib.sha256(json.dumps({
+                "domain": domain,
+                "source": source_label,
+                "dorks": [(c, d, q) for c, d, q in dorks],
+                "engines": [n for n, _ in engines],
+                "strict": strict,
+                "max_pages": args.max_pages,
+                "max_per_dork": args.max_per_dork,
+            }, sort_keys=True).encode()).hexdigest()[:16]
+
+            if args.resume and progress_path.exists():
+                try:
+                    progress = json.loads(progress_path.read_text())
+                    if isinstance(progress, dict) and progress.get("fingerprint") == run_fingerprint:
+                        completed_dorks = set(progress.get("completed", []))
+                        log.info("resumed: %d completed dorks (fingerprint match)",
+                                 len(completed_dorks))
+                    elif isinstance(progress, dict):
+                        log.warning("progress fingerprint mismatch — previous run "
+                                    "used different config; starting fresh")
+                    else:
+                        log.warning("progress file has old format; starting fresh")
+                except Exception as e:
+                    log.warning("could not load progress for resume: %s", e)
+
+            if args.resume and completed_dorks and findings_path.exists():
+                try:
+                    prev_findings = json.loads(findings_path.read_text())
+                    for f in prev_findings:
+                        if f.get("dork_id") in completed_dorks:
+                            findings.append(f)
+                            seen.add((f["dork_id"], f["url"]))
+                    log.info("resumed: %d findings from completed dorks", len(findings))
+                except Exception as e:
+                    log.warning("could not load findings for resume: %s", e)
+                    findings = []
+
+            total_dropped = 0
+            total = len(dorks)
+            skipped = 0
+            run_started = time.time()
+            for idx, (cat, dork_id, query) in enumerate(dorks, start=1):
+                if dork_id in completed_dorks:
+                    skipped += 1
+                    log.info("[%d/%d] %s/%s: skipped (resume)", idx, total, cat, dork_id)
+                    continue
+                section(f"[{idx}/{total}] {cat}/{dork_id}: {query}")
+                sr = search_engines_parallel(engines, query)
+                engine_failures = set(sr.failed_engines)
+                if google and google.captcha_seen:
+                    engine_failures.add("google")
+                for engine_name, items in sr.items.items():
+                    hits = 0
+                    dropped = 0
+                    for item in items:
+                        if hits >= args.max_per_dork:
+                            break
+                        href = (item.get("href") if isinstance(item, dict)
+                                else item) or ""
+                        if not href.startswith(("http://", "https://")):
+                            continue
+                        nu = normalize_url(href)
+                        key = (dork_id, nu)
+                        if key in seen:
+                            continue
+                        if strict and is_noise_host(nu):
+                            dropped += 1
+                            continue
+                        title = item.get("title", "") if isinstance(item, dict) else ""
+                        snippet = item.get("body", "") if isinstance(item, dict) else ""
+                        if strict and not validate_dork_match(query, nu, title, snippet):
+                            dropped += 1
+                            continue
+                        seen.add(key)
+                        if args.show_urls:
+                            if title:
+                                log.info("  %s-> %s%s  %s%s%s",
+                                         C.CYAN, nu, C.RESET, C.DIM, title, C.RESET)
+                            else:
+                                log.info("  %s-> %s%s", C.CYAN, nu, C.RESET)
+                        findings.append({
+                            "category": cat,
+                            "dork_id": dork_id,
+                            "dork_query": query,
+                            "url": nu,
+                            "title": title,
+                            "snippet": snippet,
+                            "engine": engine_name,
+                            "found_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        hits += 1
+                    if dropped:
+                        total_dropped += dropped
+                        log.info("%s%s: dropped %d false-positive(s) for %s/%s%s",
+                                 C.YELLOW, engine_name, dropped, cat, dork_id, C.RESET)
+                    if hits:
+                        log.info("%s%s: %d hits for %s/%s%s",
+                                 C.GREEN, engine_name, hits, cat, dork_id, C.RESET)
+                    else:
+                        log.info("%s: 0 hits for %s/%s",
+                                 engine_name, cat, dork_id)
+                if engine_failures:
+                    log.warning("dork %s/%s: not marking complete — "
+                                "engine(s) failed: %s",
+                                cat, dork_id, ", ".join(sorted(engine_failures)))
+                else:
+                    completed_dorks.add(dork_id)
+                atomic_write_json(findings_path, findings)
+                atomic_write_json(progress_path, {
+                    "fingerprint": run_fingerprint,
+                    "completed": sorted(completed_dorks),
+                })
+                elapsed = time.time() - run_started
+                done = idx - skipped
+                avg = elapsed / max(done, 1)
+                remaining = avg * (total - idx)
+                log.info("progress: %d/%d (%d%%) | elapsed %s | eta %s",
+                         idx, total, int(idx * 100 / total),
+                         _fmt_dur(elapsed), _fmt_dur(remaining))
+
+            log.info("wrote findings.json: %d entries", len(findings))
+            if strict and total_dropped:
+                log.info("strict-mode dropped %d fuzzy-match false-positives "
+                         "(use --no-strict to keep them)", total_dropped)
+            print_dork_summary(findings, dorks)
+            render_dork_report(findings, domain, dorks, target_dir)
+            section(f"done: {domain}")
     finally:
         if google:
             google.close()
 
-    log.info("wrote findings.json: %d entries", len(findings))
-    if strict and total_dropped:
-        log.info("strict-mode dropped %d fuzzy-match false-positives "
-                 "(use --no-strict to keep them)", total_dropped)
-    print_dork_summary(findings, dorks)
-    render_dork_report(findings, args.domain, dorks, target_dir)
-    section("done")
     return 0
 
 

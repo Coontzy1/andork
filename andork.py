@@ -688,6 +688,7 @@ class GoogleSelenium:
         self.wait_for_captcha = wait_for_captcha
         self.driver = None
         self.captcha_seen = False
+        self.soft_blocked = False
 
     def _dump(self, tag: str) -> None:
         if not self.driver:
@@ -980,17 +981,44 @@ class GoogleSelenium:
             if items:
                 log.info("%sgoogle page %d: %d raw results%s",
                          C.GREEN, page, len(items), C.RESET)
-            else:
+                yield from items
+                continue
+
+            # Zero results. A genuine empty SERP still renders a results
+            # container; no container at all means Google served a shell
+            # without ever redirecting to /sorry/, so the CAPTCHA path
+            # above never fired. Those two cases look identical in the
+            # logs otherwise, and reporting a soft block as "0 results"
+            # reads as "nothing is indexed", which is a different finding.
+            if self._has_results_container(self.driver):
                 log.info("google page %d: 0 raw results", page)
-            yield from items
-            if not items:
-                self._dump(f"empty-p{page}")
-                return
+            else:
+                self.soft_blocked = True
+                log.error(
+                    "%sgoogle page %d: no SERP body and no off-Google links "
+                    "in the DOM — Google served a shell (soft block) rather "
+                    "than results. This is NOT a confirmed zero; re-run "
+                    "--headed with --user-data-dir, or treat the other "
+                    "engine as the source of truth. See the dump below.%s",
+                    C.RED, page, C.RESET,
+                )
+            self._dump(f"empty-p{page}")
+            return
 
     def _has_results_container(self, d) -> bool:
+        """Did Google render a SERP body at all?
+
+        Deliberately broad: any known wrapper, or simply a result
+        heading. Narrow class-name checks here caused the same silent
+        zero the extractor used to, so an <h3> counts.
+        """
         from selenium.webdriver.common.by import By
         return bool(
-            d.find_elements(By.CSS_SELECTOR, "div#search, div#rso, div#main")
+            d.find_elements(
+                By.CSS_SELECTOR,
+                "div#search, div#rso, div#main, div#center_col, "
+                "div[data-async-context], h3",
+            )
         )
 
     def _click_next(self) -> bool:
@@ -1020,90 +1048,128 @@ class GoogleSelenium:
                 continue
         return False
 
+    # Layout-independent result scrape. Google's result wrappers are
+    # obfuscated and rotate (div.g -> div.tF2Cxc -> div.MjjYud -> ...),
+    # so keying off class names silently returns zero the moment they
+    # change — the page looks fine to a human, we just find nothing.
+    # This keys off the only stable thing on a SERP: anchors pointing
+    # off-Google. Runs as one script instead of hundreds of selenium
+    # round-trips, so it's also much faster on a full page of results.
+    _EXTRACT_JS = r"""
+const BAD_HOST = /(^|\.)(google\.[a-z.]{2,}|gstatic\.com|googleusercontent\.com|googleapis\.com|googleadservices\.com|schema\.org|w3\.org)$/i;
+const out = [], seen = new Set();
+
+function unwrap(raw) {
+  let u;
+  try { u = new URL(raw); } catch (e) { return null; }
+  if (/(^|\.)google\.[a-z.]{2,}$/i.test(u.hostname) &&
+      (u.pathname === '/url' || u.pathname === '/imgres')) {
+    const q = u.searchParams.get('q') || u.searchParams.get('url') ||
+              u.searchParams.get('imgurl');
+    if (q) { try { return new URL(q).href; } catch (e) { return null; } }
+  }
+  return u.href;
+}
+
+// Climb to the block that holds this result, so we can read its
+// title and snippet without knowing what the block is called.
+function blockOf(a) {
+  // Climb only while the ancestor still describes ONE result: a second
+  // heading (or a pile of links) means we've reached the list wrapper,
+  // and its text would splice neighbouring results into our snippet.
+  let n = a, best = a;
+  for (let i = 0; i < 6 && n.parentElement; i++) {
+    const p = n.parentElement;
+    if (p.querySelectorAll('h3').length > 1) break;
+    if (p.querySelectorAll('a[href]').length > 3) break;
+    n = p; best = p;
+  }
+  return best;
+}
+
+for (const a of document.querySelectorAll('a[href]')) {
+  const href = unwrap(a.href || '');
+  if (!href || !/^https?:/i.test(href)) continue;
+  let host;
+  try { host = new URL(href).hostname; } catch (e) { continue; }
+  if (!host || BAD_HOST.test(host)) continue;
+  if (seen.has(href)) continue;
+
+  // Skip chrome that lives outside the results area.
+  if (a.closest('header, footer, nav, #searchform, #topabar')) continue;
+
+  const blk = blockOf(a);
+  let title = '';
+  const h = a.querySelector('h3') || blk.querySelector('h3') ||
+            blk.querySelector("[role='heading']");
+  if (h) title = (h.innerText || '').trim();
+  if (!title) title = (a.innerText || '').trim().split('\n')[0];
+
+  let body = '';
+  const txt = (blk.innerText || '').trim();
+  if (txt && title && txt.startsWith(title)) body = txt.slice(title.length).trim();
+  else body = txt;
+  body = body.replace(/\s+/g, ' ').slice(0, 500);
+
+  seen.add(href);
+  out.push({href: href, title: title.slice(0, 300), body: body});
+}
+return out;
+"""
+
     def _extract_results(self) -> list[dict]:
-        """Pull results with best-effort title/snippet extraction.
+        """Pull results without depending on Google's CSS class names."""
+        try:
+            raw = self.driver.execute_script(self._EXTRACT_JS) or []
+        except Exception as e:
+            msg = str(e).splitlines()[0] if str(e) else "(no message)"
+            log.warning("google: JS extract failed (%s), using DOM fallback", msg)
+            return self._extract_results_dom()
 
-        Tries container-based extraction first (find each result block,
-        then extract URL + title + snippet from within it). Falls back
-        to the broad anchor-scan if no containers match.
-        """
-        from selenium.webdriver.common.by import By
-        container_selectors = ("div.g", "div.tF2Cxc", "div.MjjYud")
-        title_selectors = ("h3", "a h3", "div[role='heading']")
-        snippet_selectors = (
-            "div.VwiC3b", "span.aCOpRe", "div[data-sncf]",
-            "div.IsZvec", "div[style*='line-clamp']",
-        )
-
-        seen: set[str] = set()
-        out: list[dict] = []
-
-        for csel in container_selectors:
-            for container in self.driver.find_elements(By.CSS_SELECTOR, csel):
-                try:
-                    anchors = container.find_elements(By.CSS_SELECTOR, "a[href]")
-                    href = ""
-                    for a in anchors:
-                        h = a.get_attribute("href") or ""
-                        real = self._unwrap_url_q(h)
-                        if real and real.startswith(("http://", "https://")):
-                            host = up.urlsplit(real).hostname or ""
-                            if not host.endswith(("google.com", "gstatic.com")):
-                                href = real
-                                break
-                    if not href or href in seen:
-                        continue
-
-                    title = ""
-                    for tsel in title_selectors:
-                        try:
-                            el = container.find_element(By.CSS_SELECTOR, tsel)
-                            title = (el.text or "").strip()
-                            if title:
-                                break
-                        except Exception:
-                            pass
-
-                    snippet = ""
-                    for ssel in snippet_selectors:
-                        try:
-                            el = container.find_element(By.CSS_SELECTOR, ssel)
-                            snippet = (el.text or "").strip()
-                            if snippet:
-                                break
-                        except Exception:
-                            pass
-
-                    seen.add(href)
-                    out.append({"href": href, "title": title, "body": snippet})
-                except Exception:
-                    continue
-
+        out = []
+        for r in raw:
+            try:
+                href = (r.get("href") or "").strip()
+            except AttributeError:
+                continue
+            if href.startswith(("http://", "https://")):
+                out.append({
+                    "href": href,
+                    "title": (r.get("title") or "").strip(),
+                    "body": (r.get("body") or "").strip(),
+                })
         if out:
             return out
+        return self._extract_results_dom()
 
-        # Fallback: broad anchor scan (no title/snippet)
-        fallback_selectors = (
-            "div#search a[href]", "div#rso a[href]", "div#main a[href]",
-            "div[data-async-context] a[href]", "div.MjjYud a[href]",
-            "div.tF2Cxc a[href]", "div.g a[href]",
-        )
-        for sel in fallback_selectors:
-            for a in self.driver.find_elements(By.CSS_SELECTOR, sel):
-                try:
-                    href = a.get_attribute("href") or ""
-                except Exception:
-                    continue
-                real = self._unwrap_url_q(href)
-                if not real or not real.startswith(("http://", "https://")):
-                    continue
-                host = up.urlsplit(real).hostname or ""
-                if host.endswith(("google.com", "gstatic.com")):
-                    continue
-                if real in seen:
-                    continue
-                seen.add(real)
-                out.append({"href": real, "title": "", "body": ""})
+    def _extract_results_dom(self) -> list[dict]:
+        """Selenium-side fallback for when JS is unavailable or empty."""
+        from selenium.webdriver.common.by import By
+        seen: set[str] = set()
+        out: list[dict] = []
+        for a in self.driver.find_elements(By.CSS_SELECTOR, "a[href]"):
+            try:
+                href = a.get_attribute("href") or ""
+            except Exception:
+                continue
+            real = self._unwrap_url_q(href)
+            if not real or not real.startswith(("http://", "https://")):
+                continue
+            host = (up.urlsplit(real).hostname or "").lower()
+            if not host or host.endswith((
+                "google.com", "gstatic.com", "googleusercontent.com",
+                "googleapis.com", "schema.org", "w3.org",
+            )):
+                continue
+            if real in seen:
+                continue
+            title = ""
+            try:
+                title = (a.text or "").strip().split("\n")[0]
+            except Exception:
+                pass
+            seen.add(real)
+            out.append({"href": real, "title": title, "body": ""})
         return out
 
     @staticmethod
@@ -1324,9 +1390,11 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
                         "ddgs handles its own pagination internally. "
                         "Default: 5 for metadata, 1 for curated dork, "
                         "3 for custom dork-file.")
-    p.add_argument("--search-delay", type=int, default=30,
+    p.add_argument("--search-delay", type=int, default=60,
                    help=f"Seconds between searches per engine "
-                        f"(min {MIN_SEARCH_DELAY}; engines run in parallel)")
+                        f"(default 60, min {MIN_SEARCH_DELAY}; engines run "
+                        f"in parallel, so this paces DDG the same as "
+                        f"--google-delay paces Google)")
     p.add_argument("--google-delay", type=int, default=60,
                    help="Seconds between Google searches (default 60 — "
                         "Google triggers CAPTCHAs faster than DDG, so we "
@@ -1719,6 +1787,7 @@ def cmd_metadata(args) -> int:
                 section(f"DOMAIN: {domain} ({di}/{len(domains)})")
             if google:
                 google.captcha_seen = False
+                google.soft_blocked = False
 
             target_dir = Path(args.output) / domain / "metadata"
             files_dir = target_dir / "files"
@@ -1792,6 +1861,13 @@ def cmd_metadata(args) -> int:
                         log.info("%s: 0 %s %s URLs", engine_name, scope_label, ext)
                 atomic_write_json(state_path, state)
 
+            if google and google.soft_blocked:
+                log.error(
+                    "%sgoogle was soft-blocked during this sweep — any "
+                    "0-URL counts above are unreliable for google. Re-run "
+                    "--headed with --user-data-dir before concluding a "
+                    "domain has no indexed documents.%s", C.RED, C.RESET,
+                )
             log.info("=== download phase: %d unique URLs ===", len(state["urls"]))
             url_to_sha = {rec["url"]: sha
                           for sha, rec in state["downloads"].items()}
@@ -2158,6 +2234,7 @@ def cmd_dork(args) -> int:
                 section(f"DOMAIN: {domain} ({di}/{len(domains)})")
             if google:
                 google.captcha_seen = False
+                google.soft_blocked = False
 
             source_label = "curated"
             if args.dork_file:
@@ -2243,7 +2320,7 @@ def cmd_dork(args) -> int:
                 section(f"[{idx}/{total}] {cat}/{dork_id}: {query}")
                 sr = search_engines_parallel(engines, query)
                 engine_failures = set(sr.failed_engines)
-                if google and google.captcha_seen:
+                if google and (google.captcha_seen or google.soft_blocked):
                     engine_failures.add("google")
                 for engine_name, items in sr.items.items():
                     hits = 0

@@ -725,6 +725,9 @@ class GoogleSelenium:
         self.driver = None
         self.captcha_seen = False
         self.soft_blocked = False
+        self._redir_cache: dict = {}
+        self._redir_sess = None
+        self.redirect_delay = 0.4
 
     def _dump(self, tag: str) -> None:
         if not self.driver:
@@ -1104,32 +1107,46 @@ class GoogleSelenium:
     # Layout-independent result scrape. Google's result wrappers are
     # obfuscated and rotate (div.g -> div.tF2Cxc -> div.MjjYud -> ...),
     # so keying off class names silently returns zero the moment they
-    # change — the page looks fine to a human, we just find nothing.
-    # This keys off the only stable thing on a SERP: anchors pointing
-    # off-Google. Runs as one script instead of hundreds of selenium
-    # round-trips, so it's also much faster on a full page of results.
+    # change. This keys off anchors instead.
+    #
+    # Google also no longer exposes the destination in the markup: result
+    # links are now relative /goto?url=<blob> redirects whose payload is
+    # an encrypted protobuf (no plaintext URL anywhere in the DOM, and
+    # the <cite> shows only a lossy display path). Those are emitted with
+    # pending=true and resolved over HTTP afterwards.
     _EXTRACT_JS = r"""
-const BAD_HOST = /(^|\.)(google\.[a-z.]{2,}|gstatic\.com|googleusercontent\.com|googleapis\.com|googleadservices\.com|schema\.org|w3\.org)$/i;
+const BAD_HOST = /(^|\.)(gstatic\.com|googleusercontent\.com|googleapis\.com|googleadservices\.com|schema\.org|w3\.org)$/i;
+const GOOGLE = /(^|\.)google\.[a-z.]{2,}$/i;
+const REDIR_PATH = /^\/(goto|url|imgres)$/;
 const out = [], seen = new Set();
 
-function unwrap(raw) {
+function classify(raw) {
   let u;
-  try { u = new URL(raw); } catch (e) { return null; }
-  if (/(^|\.)google\.[a-z.]{2,}$/i.test(u.hostname) &&
-      (u.pathname === '/url' || u.pathname === '/imgres')) {
-    const q = u.searchParams.get('q') || u.searchParams.get('url') ||
-              u.searchParams.get('imgurl');
-    if (q) { try { return new URL(q).href; } catch (e) { return null; } }
+  try { u = new URL(raw, document.baseURI); } catch (e) { return null; }
+  if (!/^https?:$/.test(u.protocol)) return null;
+  if (GOOGLE.test(u.hostname)) {
+    if (!REDIR_PATH.test(u.pathname)) return null;      // nav/footer chrome
+    // Legacy plaintext form first.
+    const q = u.searchParams.get('q') || u.searchParams.get('imgurl');
+    if (q) {
+      try {
+        const t = new URL(q, location.href);
+        if (/^https?:$/.test(t.protocol) && !GOOGLE.test(t.hostname)
+            && !BAD_HOST.test(t.hostname)) return {href: t.href, pending: false};
+      } catch (e) {}
+    }
+    const opaque = u.searchParams.get('url');
+    if (opaque) return {href: u.href, pending: true};   // resolve over HTTP
+    return null;
   }
-  return u.href;
+  if (BAD_HOST.test(u.hostname)) return null;
+  return {href: u.href, pending: false};
 }
 
-// Climb to the block that holds this result, so we can read its
-// title and snippet without knowing what the block is called.
+// Climb only while the ancestor still describes ONE result: a second
+// heading (or a pile of links) means we've reached the list wrapper,
+// and its text would splice neighbouring results into our snippet.
 function blockOf(a) {
-  // Climb only while the ancestor still describes ONE result: a second
-  // heading (or a pile of links) means we've reached the list wrapper,
-  // and its text would splice neighbouring results into our snippet.
   let n = a, best = a;
   for (let i = 0; i < 6 && n.parentElement; i++) {
     const p = n.parentElement;
@@ -1141,14 +1158,8 @@ function blockOf(a) {
 }
 
 for (const a of document.querySelectorAll('a[href]')) {
-  const href = unwrap(a.href || '');
-  if (!href || !/^https?:/i.test(href)) continue;
-  let host;
-  try { host = new URL(href).hostname; } catch (e) { continue; }
-  if (!host || BAD_HOST.test(host)) continue;
-  if (seen.has(href)) continue;
-
-  // Skip chrome that lives outside the results area.
+  const c = classify(a.href || a.getAttribute('href') || '');
+  if (!c || seen.has(c.href)) continue;
   if (a.closest('header, footer, nav, #searchform, #topabar')) continue;
 
   const blk = blockOf(a);
@@ -1158,45 +1169,128 @@ for (const a of document.querySelectorAll('a[href]')) {
   if (h) title = (h.innerText || '').trim();
   if (!title) title = (a.innerText || '').trim().split('\n')[0];
 
+  // The <cite> is a lossy display URL, but it names the host, which is
+  // enough to scope-check a result before paying for a redirect fetch.
+  let cite = '';
+  const ce = blk.querySelector('cite');
+  if (ce) cite = (ce.innerText || '').trim();
+
   let body = '';
   const txt = (blk.innerText || '').trim();
-  if (txt && title && txt.startsWith(title)) body = txt.slice(title.length).trim();
-  else body = txt;
+  body = (txt && title && txt.startsWith(title)) ? txt.slice(title.length).trim() : txt;
   body = body.replace(/\s+/g, ' ').slice(0, 500);
 
-  seen.add(href);
-  out.push({href: href, title: title.slice(0, 300), body: body});
+  seen.add(c.href);
+  out.push({href: c.href, pending: !!c.pending, cite: cite,
+            title: title.slice(0, 300), body: body});
 }
 return out;
 """
 
     def _extract_results(self) -> list[dict]:
-        """Pull results without depending on Google's CSS class names."""
+        """Pull results, resolving Google's opaque /goto redirects."""
         try:
             raw = self.driver.execute_script(self._EXTRACT_JS) or []
         except Exception as e:
             msg = str(e).splitlines()[0] if str(e) else "(no message)"
             log.warning("google: JS extract failed (%s), using DOM fallback", msg)
-            return self._extract_results_dom()
+            raw = self._extract_results_dom()
 
-        out = []
+        out, unresolved = [], 0
         for r in raw:
-            try:
-                href = (r.get("href") or "").strip()
-            except AttributeError:
+            if not isinstance(r, dict):
                 continue
-            if href.startswith(("http://", "https://")):
-                out.append({
-                    "href": href,
-                    "title": (r.get("title") or "").strip(),
-                    "body": (r.get("body") or "").strip(),
-                })
-        if out:
-            return out
-        return self._extract_results_dom()
+            href = (r.get("href") or "").strip()
+            if not href:
+                continue
+            if r.get("pending"):
+                target = self._resolve_redirect(href)
+                if not target:
+                    unresolved += 1
+                    continue
+                href = target
+            if not href.startswith(("http://", "https://")):
+                continue
+            out.append({
+                "href": href,
+                "title": (r.get("title") or "").strip(),
+                "body": (r.get("body") or "").strip(),
+            })
+        if unresolved:
+            log.warning("google: %d result(s) had an unresolvable /goto "
+                        "redirect and were skipped", unresolved)
+        return out
+
+    def _redirect_session(self):
+        """A requests session wearing the browser's cookies and UA.
+
+        Google's /goto endpoint only answers correctly for the session
+        that was served the SERP, so the cookies have to come across.
+        """
+        if getattr(self, "_redir_sess", None) is not None:
+            return self._redir_sess
+        import requests
+        sess = requests.Session()
+        try:
+            ua = self.driver.execute_script("return navigator.userAgent")
+            if ua:
+                sess.headers["User-Agent"] = ua
+        except Exception:
+            pass
+        try:
+            for c in self.driver.get_cookies():
+                try:
+                    sess.cookies.set(c["name"], c["value"],
+                                     domain=c.get("domain"),
+                                     path=c.get("path", "/"))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        self._redir_sess = sess
+        return sess
+
+    def _resolve_redirect(self, goto_url: str, hops: int = 3) -> Optional[str]:
+        """Follow a Google redirect to the destination it hides.
+
+        Cached, because the same document can appear on several pages of
+        a sweep and each miss costs a round trip.
+        """
+        if goto_url in self._redir_cache:
+            return self._redir_cache[goto_url]
+
+        result = None
+        try:
+            sess = self._redirect_session()
+            url = goto_url
+            for _ in range(hops):
+                r = sess.get(url, allow_redirects=False, timeout=15)
+                loc = r.headers.get("Location")
+                if not loc:
+                    break
+                url = up.urljoin(url, loc)
+                host = (up.urlsplit(url).hostname or "").lower()
+                if not host.endswith("google.com"):
+                    result = url
+                    break
+            else:
+                log.debug("google: redirect hop limit on %s", goto_url[:80])
+        except Exception as e:
+            msg = str(e).splitlines()[0] if str(e) else "(no message)"
+            log.warning("google: could not resolve redirect (%s)", msg)
+
+        self._redir_cache[goto_url] = result
+        if result:
+            # Clicking through costs a request each; stay unremarkable.
+            time.sleep(self.redirect_delay)
+        return result
 
     def _extract_results_dom(self) -> list[dict]:
-        """Selenium-side fallback for when JS is unavailable or empty."""
+        """Selenium-side fallback for when the JS scrape is unavailable.
+
+        Returns the same shape as the JS path, pending flag included, so
+        opaque redirects still get resolved.
+        """
         from selenium.webdriver.common.by import By
         seen: set[str] = set()
         out: list[dict] = []
@@ -1205,24 +1299,38 @@ return out;
                 href = a.get_attribute("href") or ""
             except Exception:
                 continue
-            real = self._unwrap_url_q(href)
-            if not real or not real.startswith(("http://", "https://")):
+            if not href.startswith(("http://", "https://")):
                 continue
-            host = (up.urlsplit(real).hostname or "").lower()
-            if not host or host.endswith((
-                "google.com", "gstatic.com", "googleusercontent.com",
+            parts = up.urlsplit(href)
+            host = (parts.hostname or "").lower()
+            pending = False
+            if host.endswith("google.com"):
+                if parts.path not in ("/goto", "/url", "/imgres"):
+                    continue
+                plain = self._unwrap_url_q(href)
+                if plain and plain != href and not (
+                    (up.urlsplit(plain).hostname or "").endswith("google.com")
+                ):
+                    href = plain
+                elif up.parse_qs(parts.query).get("url"):
+                    pending = True
+                else:
+                    continue
+            elif host.endswith((
+                "gstatic.com", "googleusercontent.com",
                 "googleapis.com", "schema.org", "w3.org",
-            )):
+            )) or not host:
                 continue
-            if real in seen:
+            if href in seen:
                 continue
             title = ""
             try:
                 title = (a.text or "").strip().split("\n")[0]
             except Exception:
                 pass
-            seen.add(real)
-            out.append({"href": real, "title": title, "body": ""})
+            seen.add(href)
+            out.append({"href": href, "pending": pending,
+                        "title": title, "body": ""})
         return out
 
     @staticmethod
@@ -1239,6 +1347,12 @@ return out;
         return href
 
     def close(self):
+        if self._redir_sess is not None:
+            try:
+                self._redir_sess.close()
+            except Exception:
+                pass
+            self._redir_sess = None
         if self.driver:
             try:
                 self.driver.quit()

@@ -378,6 +378,10 @@ def in_scope(host: str, domain: str) -> bool:
         return False
     h = host.lower().split(":")[0]
     d = domain.lower()
+    if h.startswith("www."):
+        h = h[4:]
+    if d.startswith("www."):
+        d = d[4:]
     return h == d or h.endswith("." + d)
 
 
@@ -405,6 +409,8 @@ def _strip_tracking(query: str) -> str:
 def normalize_url(url: str) -> str:
     p = up.urlsplit(url)
     host = (p.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
     netloc = host
     if p.port and not (
         (p.scheme == "http" and p.port == 80)
@@ -462,7 +468,7 @@ def is_noise_host(url: str) -> bool:
 
 
 def extract_ext(url: str) -> Optional[str]:
-    path = up.urlsplit(url).path.lower()
+    path = up.urlsplit(url).path.lower().rstrip("/")
     if "." not in path:
         return None
     ext = path.rsplit(".", 1)[1]
@@ -690,18 +696,25 @@ class GoogleSelenium:
             self.debug_dir.mkdir(parents=True, exist_ok=True)
             ts = int(time.time())
             stem = self.debug_dir / f"google-{tag}-{ts}"
+            saved = []
             try:
                 self.driver.save_screenshot(str(stem) + ".png")
+                saved.append("png")
             except Exception:
                 pass
             try:
                 (Path(str(stem) + ".html")).write_text(
                     self.driver.page_source or ""
                 )
+                saved.append("html")
             except Exception:
                 pass
-            log.warning("google: dumped %s.{png,html} (current_url=%s)",
-                        stem, self.driver.current_url)
+            if saved:
+                log.warning("google: dumped %s.{%s} (current_url=%s)",
+                            stem, ",".join(saved), self.driver.current_url)
+            else:
+                log.warning("google: dump failed for %s (current_url=%s)",
+                            stem, self.driver.current_url)
         except Exception as e:
             log.warning("google: dump failed: %s", e)
 
@@ -1098,10 +1111,12 @@ class GoogleSelenium:
         if not href:
             return None
         if "/url?" in href:
-            qs = up.urlsplit(href).query
-            q = up.parse_qs(qs).get("q", [None])[0]
-            if q:
-                return q
+            parsed = up.urlsplit(href)
+            h = (parsed.hostname or "").lower()
+            if h.endswith("google.com"):
+                q = up.parse_qs(parsed.query).get("q", [None])[0]
+                if q:
+                    return q
         return href
 
     def close(self):
@@ -1173,6 +1188,7 @@ def download_one(
                 log.info("download skip %s: streamed > %dMB cap", url, max_size_mb)
                 tf.close()
                 os.unlink(tf.name)
+                r.close()
                 return None
             h.update(chunk)
             tf.write(chunk)
@@ -1599,6 +1615,11 @@ def validate_domain(d: str) -> str:
             "[note] stripping leading '*.' — subdomains are auto-included\n"
         )
         d = d[2:]
+    if d.lower().startswith("www.") and d.count(".") >= 2:
+        sys.stderr.write(
+            "[note] stripping leading 'www.' — Google site: matches all subdomains\n"
+        )
+        d = d[4:]
     if "/" in d or ":" in d or "*" in d:
         raise SystemExit("domain must be a bare host (no scheme/path/port/wildcard)")
     if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", d):
@@ -1689,6 +1710,8 @@ def cmd_metadata(args) -> int:
                                   args.captcha_timeout,
                                   args.wait_for_captcha))
     engines = [(n, e) for n, e in (("ddg", ddg), ("google", google)) if e]
+    if not engines:
+        raise SystemExit("no search engines enabled (--no-ddg and --no-google both set)")
 
     try:
         for di, domain in enumerate(domains, start=1):
@@ -1814,6 +1837,7 @@ def cmd_metadata(args) -> int:
     finally:
         if google:
             google.close()
+        sess_dl.close()
 
     return 0
 
@@ -2006,7 +2030,7 @@ def _eval_clause(op: str, val: str,
     if op in ("filetype", "ext"):
         return bool(re.search(rf"\.{re.escape(vl)}(?:[?#/]|$)", u))
     if op == "site":
-        host = up.urlsplit(url).netloc.lower()
+        host = (up.urlsplit(url).hostname or "").lower()
         return host == vl or host.endswith("." + vl)
     if op == "intitle":
         return None if not has_text else (vl in t)
@@ -2100,6 +2124,8 @@ def cmd_dork(args) -> int:
                                   args.captcha_timeout,
                                   args.wait_for_captcha))
     engines = [(n, e) for n, e in (("ddg", ddg), ("google", google)) if e]
+    if not engines and not getattr(args, "list_dorks", False):
+        raise SystemExit("no search engines enabled (--no-ddg and --no-google both set)")
 
     # --list-dorks: show dorks for first domain and exit
     if args.list_dorks:
@@ -2283,7 +2309,11 @@ def cmd_dork(args) -> int:
                 elapsed = time.time() - run_started
                 done = idx - skipped
                 avg = elapsed / max(done, 1)
-                remaining = avg * (total - idx)
+                remaining_todo = sum(
+                    1 for _, d, _ in dorks[idx:]
+                    if d not in completed_dorks
+                )
+                remaining = avg * remaining_todo
                 log.info("progress: %d/%d (%d%%) | elapsed %s | eta %s",
                          idx, total, int(idx * 100 / total),
                          _fmt_dur(elapsed), _fmt_dur(remaining))

@@ -9,7 +9,7 @@ description = "OSINT recon for external pen tests — document metadata harvest 
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "Austin Coontz", email = "austin.coontz@trustedsec.com" },
+    { name = "Austin Coontz", email = "coontz.austin@gmail.com" },
 ]
 keywords = ["osint", "pentest", "recon", "metadata", "exiftool", "google-dorks"]
 classifiers = [

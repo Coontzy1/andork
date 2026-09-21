@@ -406,6 +406,35 @@ def _strip_tracking(query: str) -> str:
     return up.urlencode(kept, doseq=True)
 
 
+def clean_result_url(href: Optional[str]) -> Optional[str]:
+    """Normalise a search-result URL, or None if it isn't usable.
+
+    ddgs hands back protocol-relative URLs and DuckDuckGo's own
+    /l/?uddg= redirect wrapper. Both used to be dropped on the
+    startswith('http') check, so a result silently vanished between the
+    "raw results" count and the URL count with no line in the log.
+    """
+    if not href:
+        return None
+    href = href.strip()
+    if href.startswith("//"):
+        href = "https:" + href
+    try:
+        parts = up.urlsplit(href)
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    if host.endswith("duckduckgo.com") and parts.path.startswith("/l/"):
+        # parse_qs already percent-decodes; don't unquote twice or a
+        # legitimate %2B in the target turns into a space.
+        target = up.parse_qs(parts.query).get("uddg", [None])[0]
+        if target:
+            href = target.strip()
+    if not href.startswith(("http://", "https://")):
+        return None
+    return href
+
+
 def normalize_url(url: str) -> str:
     p = up.urlsplit(url)
     host = (p.hostname or "").lower()
@@ -578,18 +607,25 @@ class DDGSearch:
             return
         log.info("%sddgs: %d raw results for %r%s",
                  C.GREEN, len(results), dork, C.RESET)
+        dropped = []
         for item in results:
-            href = (
+            raw = (
                 item.get("href")
                 or item.get("url")
                 or item.get("link")
             )
-            if href and href.startswith(("http://", "https://")):
-                yield {
-                    "href": href,
-                    "title": item.get("title") or "",
-                    "body": item.get("body") or "",
-                }
+            href = clean_result_url(raw)
+            if not href:
+                dropped.append(raw)
+                continue
+            yield {
+                "href": href,
+                "title": item.get("title") or "",
+                "body": item.get("body") or "",
+            }
+        if dropped:
+            log.warning("ddgs: dropped %d unusable result URL(s) for %r: %s",
+                        len(dropped), dork, dropped[:3])
 
     def _dump(self, dork: str, results: list) -> None:
         try:
@@ -974,10 +1010,12 @@ class GoogleSelenium:
                 log.info("google page %d: no results for dork", page)
                 return
 
-            # Give JS a beat to populate result divs (some Google layouts
-            # hydrate after initial render).
-            time.sleep(1.5)
-            items = self._extract_results()
+            # Google hydrates results after first paint, and with
+            # page_load_strategy='eager' we routinely arrive before that.
+            # A flat sleep either wastes time or scrapes an empty DOM and
+            # reports a confident zero for a page that visibly has
+            # results, so poll until they actually show up.
+            items = self._await_results()
             if items:
                 log.info("%sgoogle page %d: %d raw results%s",
                          C.GREEN, page, len(items), C.RESET)
@@ -1004,6 +1042,21 @@ class GoogleSelenium:
                 )
             self._dump(f"empty-p{page}")
             return
+
+    def _await_results(self, timeout: float = 8.0) -> list[dict]:
+        """Re-run the extractor until the SERP hydrates or time runs out.
+
+        Returns as soon as anything is found, so a populated page costs
+        one extra poll rather than the full timeout.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            items = self._extract_results()
+            if items:
+                return items
+            if time.monotonic() >= deadline:
+                return []
+            time.sleep(0.5)
 
     def _has_results_container(self, d) -> bool:
         """Did Google render a SERP body at all?

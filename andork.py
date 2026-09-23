@@ -1948,6 +1948,8 @@ def cmd_metadata(args) -> int:
     if not engines:
         raise SystemExit("no search engines enabled (--no-ddg and --no-google both set)")
 
+    all_domain_metadata: list[tuple[str, list[dict]]] = []
+
     try:
         for di, domain in enumerate(domains, start=1):
             if len(domains) > 1:
@@ -2076,7 +2078,12 @@ def cmd_metadata(args) -> int:
 
             print_metadata_summary(metadata)
             render_metadata_report(metadata, domain, target_dir)
+            all_domain_metadata.append((domain, metadata))
             section(f"done: {domain}")
+
+        if len(domains) > 1 and all_domain_metadata:
+            render_combined_metadata_report(all_domain_metadata,
+                                            Path(args.output))
     finally:
         if google:
             google.close()
@@ -2395,6 +2402,8 @@ def cmd_dork(args) -> int:
                   f"{len(domains) - 1} more domain(s) will use the same set)")
         return 0
 
+    all_domain_findings: list[tuple[str, list[dict], list[tuple[str, str, str]]]] = []
+
     try:
         for di, domain in enumerate(domains, start=1):
             if len(domains) > 1:
@@ -2568,7 +2577,12 @@ def cmd_dork(args) -> int:
                          "(use --no-strict to keep them)", total_dropped)
             print_dork_summary(findings, dorks)
             render_dork_report(findings, domain, dorks, target_dir)
+            all_domain_findings.append((domain, findings, dorks))
             section(f"done: {domain}")
+
+        if len(domains) > 1 and all_domain_findings:
+            render_combined_dork_report(all_domain_findings,
+                                        Path(args.output))
     finally:
         if google:
             google.close()
@@ -3073,6 +3087,501 @@ def render_dork_report(findings: list[dict], domain: str,
     out = target_dir / "report.html"
     out.write_text("".join(parts))
     log.info("wrote %s", out)
+
+
+# -------------------- combined multi-domain reports --------------------
+
+
+def render_combined_metadata_report(
+    domain_results: list[tuple[str, list[dict]]],
+    output_root: Path,
+) -> None:
+    n_domains = len(domain_results)
+    all_metadata: list[tuple[str, dict]] = []
+    for domain, metas in domain_results:
+        for m in metas:
+            all_metadata.append((domain, m))
+
+    parts: list[str] = []
+    parts.append(f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                 f"<title>Combined metadata report — {n_domains} domains</title>"
+                 f"<style>{_HTML_CSS}</style></head><body>")
+    parts.append(f"<h1>Combined Metadata Recon — {n_domains} domains</h1>")
+    parts.append(f"<p class='meta'>Generated "
+                 f"{datetime.now(timezone.utc).isoformat()} · "
+                 f"{len(all_metadata)} total files across "
+                 f"{n_domains} domains</p>")
+
+    # --- per-domain summary table ---
+    parts.append("<h2>Per-Domain Summary</h2>"
+                 "<table><thead><tr><th>Domain</th><th>Files</th>"
+                 "<th>Extensions</th><th>Unique Authors</th>"
+                 "<th>Unique Companies</th></tr></thead><tbody>")
+    for domain, metas in domain_results:
+        by_ext = Counter(m["ext"] for m in metas)
+        authors: set[str] = set()
+        companies: set[str] = set()
+        for m in metas:
+            exif = m.get("exif") or {}
+            for k, v in exif.items():
+                if k.split(":")[-1] == "Author" and v:
+                    authors.add(str(v))
+                if k.split(":")[-1] == "Company" and v:
+                    companies.add(str(v))
+        ext_str = " ".join(f"<span class='tag'>{_esc(e)}: {c}</span>"
+                           for e, c in by_ext.most_common())
+        if metas:
+            report_link = f"{domain}/metadata/report.html"
+            domain_cell = (f"<a href='{_esc(report_link)}'>"
+                           f"<strong>{_esc(domain)}</strong></a>")
+        else:
+            domain_cell = f"<strong>{_esc(domain)}</strong>"
+        parts.append(
+            f"<tr><td>{domain_cell}</td>"
+            f"<td>{len(metas)}</td><td>{ext_str}</td>"
+            f"<td>{len(authors)}</td><td>{len(companies)}</td></tr>")
+    parts.append("</tbody></table>")
+
+    # --- combined field tables ---
+    field_vals: dict[str, dict[str, dict[str, int]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(int)))
+    combined_paths: dict[str, dict[str, int]] = defaultdict(
+        lambda: defaultdict(int))
+    combined_emails: dict[str, dict[str, int]] = defaultdict(
+        lambda: defaultdict(int))
+
+    for domain, m in all_metadata:
+        exif = m.get("exif") or {}
+        for k, v in exif.items():
+            short = k.split(":")[-1]
+            if short in INTERESTING_FIELDS and v not in (None, ""):
+                field_vals[short][str(v)][domain] += 1
+        blob = json.dumps(exif)
+        for p in WIN_PATH_RE.findall(blob):
+            combined_paths[p][domain] += 1
+        for e in EMAIL_RE.findall(blob):
+            combined_emails[e][domain] += 1
+
+    for f in INTERESTING_FIELDS:
+        if not field_vals[f]:
+            continue
+        sorted_vals = sorted(field_vals[f].items(),
+                             key=lambda x: -sum(x[1].values()))
+        parts.append(f"<h2>{_esc(f)} <span class='meta'>"
+                     f"({len(sorted_vals)} unique)</span></h2>")
+        parts.append("<table><thead><tr><th style='width:80px'>Count</th>"
+                     "<th>Value</th><th>Domain(s)</th>"
+                     "</tr></thead><tbody>")
+        for v, domain_counts in sorted_vals[:50]:
+            total = sum(domain_counts.values())
+            doms = ", ".join(f"{_esc(d)} ({c})"
+                             for d, c in sorted(domain_counts.items()))
+            parts.append(f"<tr><td><span class='count'>{total}</span></td>"
+                         f"<td>{_esc(v)}</td><td>{doms}</td></tr>")
+        parts.append("</tbody></table>")
+
+    if combined_paths:
+        sorted_paths = sorted(combined_paths.items(),
+                              key=lambda x: -sum(x[1].values()))
+        parts.append("<h2>Windows paths discovered</h2><table><thead><tr>"
+                     "<th style='width:80px'>Count</th><th>Path</th>"
+                     "<th>Domain(s)</th></tr></thead><tbody>")
+        for p, domain_counts in sorted_paths[:30]:
+            total = sum(domain_counts.values())
+            doms = ", ".join(f"{_esc(d)} ({c})"
+                             for d, c in sorted(domain_counts.items()))
+            parts.append(f"<tr><td><span class='count'>{total}</span></td>"
+                         f"<td><code>{_esc(p)}</code></td>"
+                         f"<td>{doms}</td></tr>")
+        parts.append("</tbody></table>")
+
+    if combined_emails:
+        sorted_emails = sorted(combined_emails.items(),
+                               key=lambda x: -sum(x[1].values()))
+        parts.append("<h2>Email addresses</h2><table><thead><tr>"
+                     "<th style='width:80px'>Count</th><th>Email</th>"
+                     "<th>Domain(s)</th></tr></thead><tbody>")
+        for e, domain_counts in sorted_emails[:50]:
+            total = sum(domain_counts.values())
+            doms = ", ".join(f"{_esc(d)} ({c})"
+                             for d, c in sorted(domain_counts.items()))
+            parts.append(f"<tr><td><span class='count'>{total}</span></td>"
+                         f"<td><code>{_esc(e)}</code></td>"
+                         f"<td>{doms}</td></tr>")
+        parts.append("</tbody></table>")
+
+    # --- full combined file listing ---
+    parts.append("<h2>All Files</h2><table><thead><tr><th>Domain</th>"
+                 "<th>Type</th><th>Source URL</th>"
+                 "<th>Author</th><th>Company</th><th>Producer</th>"
+                 "<th style='width:80px'>Size</th></tr></thead><tbody>")
+    for domain, m in sorted(all_metadata,
+                            key=lambda x: (x[0], x[1].get("ext", ""))):
+        exif = m.get("exif") or {}
+        author = next((v for k, v in exif.items()
+                       if k.endswith("Author") and v), "") or ""
+        company = next((v for k, v in exif.items()
+                        if k.endswith("Company") and v), "") or ""
+        producer = next((v for k, v in exif.items()
+                         if (k.endswith("Producer") or k.endswith("Application"))
+                         and v), "") or ""
+        size_kb = (m.get("size") or 0) // 1024
+        url = m.get("url", "")
+        parts.append(
+            f"<tr><td><strong>{_esc(domain)}</strong></td>"
+            f"<td><span class='tag'>{_esc(m.get('ext', ''))}</span></td>"
+            f"<td class='url-cell'><a href='{_esc(url)}' "
+            f"target='_blank' rel='noopener'>{_esc(url)}</a></td>"
+            f"<td>{_esc(author)}</td><td>{_esc(company)}</td>"
+            f"<td>{_esc(producer)}</td><td>{size_kb} KB</td></tr>")
+    parts.append("</tbody></table>")
+
+    parts.append("</body></html>")
+    out = output_root / "combined_metadata_report.html"
+    out.write_text("".join(parts))
+    log.info("wrote combined report: %s", out)
+
+
+def render_combined_dork_report(
+    domain_results: list[tuple[str, list[dict], list[tuple[str, str, str]]]],
+    output_root: Path,
+) -> None:
+    n_domains = len(domain_results)
+    all_findings: list[tuple[str, dict]] = []
+    for domain, findings, _dorks in domain_results:
+        for f in findings:
+            all_findings.append((domain, f))
+
+    all_flat = [f for _, f in all_findings]
+    domains_list = [d for d, _, _ in domain_results]
+
+    by_cat: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+    for domain, f in all_findings:
+        by_cat[f["category"]].append((domain, f))
+
+    sev_counts: Counter = Counter()
+    for f in all_flat:
+        sev_counts[CATEGORY_SEVERITY.get(f["category"], "info")] += 1
+
+    unique_hosts: set[str] = set()
+    engine_counts: Counter = Counter()
+    for f in all_flat:
+        host = up.urlsplit(f.get("url", "")).hostname or ""
+        if host:
+            unique_hosts.add(host)
+        engine_counts[f.get("engine", "?")] += 1
+
+    # per-domain severity breakdown
+    domain_sev: dict[str, Counter] = defaultdict(Counter)
+    domain_total: dict[str, int] = defaultdict(int)
+    for domain, f in all_findings:
+        sev = CATEGORY_SEVERITY.get(f["category"], "info")
+        domain_sev[domain][sev] += 1
+        domain_total[domain] += 1
+
+    # cross-domain URL analysis
+    url_domains: dict[str, set[str]] = defaultdict(set)
+    for domain, f in all_findings:
+        url_domains[f["url"]].add(domain)
+    cross_domain_urls = {u: doms for u, doms in url_domains.items()
+                         if len(doms) > 1}
+
+    # multi-dork URLs (across all domains)
+    url_dorks: dict[str, set[str]] = defaultdict(set)
+    for f in all_flat:
+        url_dorks[f["url"]].add(f["dork_id"])
+    multi_hit = {u: dids for u, dids in url_dorks.items() if len(dids) > 1}
+
+    # zero-hit dorks (no hits on ANY domain)
+    all_hit_ids: set[str] = set()
+    all_dorks_union: dict[str, tuple[str, str, list[str]]] = {}
+    for _domain, _findings, dorks in domain_results:
+        for c, d, q in dorks:
+            if d not in all_dorks_union:
+                all_dorks_union[d] = (c, d, [q])
+            elif q not in all_dorks_union[d][2]:
+                all_dorks_union[d][2].append(q)
+    for f in all_flat:
+        all_hit_ids.add(f["dork_id"])
+    zero_hit = [(c, d, qs) for d, (c, _, qs) in all_dorks_union.items()
+                if d not in all_hit_ids]
+
+    def _cat_sort_key(c: str) -> tuple:
+        sev = CATEGORY_SEVERITY.get(c, "info")
+        return (_SEV_ORDER.get(sev, 4), -len(by_cat.get(c, [])))
+
+    parts: list[str] = []
+    parts.append(f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                 f"<title>Combined dork report — {n_domains} domains</title>"
+                 f"<style>{_HTML_CSS}</style></head><body>")
+    parts.append(f"<h1>Combined Dork Sweep — {n_domains} domains</h1>")
+    parts.append(f"<p class='meta'>Generated "
+                 f"{datetime.now(timezone.utc).isoformat()} · "
+                 f"{len(all_flat)} findings across "
+                 f"{len(by_cat)} categories · "
+                 f"{n_domains} domains</p>")
+
+    # --- executive summary ---
+    if all_flat:
+        parts.append("<h2>Executive Summary</h2>")
+        parts.append("<div class='stat-row'>")
+        for sev_label, color in [("Critical", "#dc2626"), ("High", "#f97316"),
+                                  ("Medium", "#eab308"), ("Low", "#3b82f6"),
+                                  ("Info", "#6b7280")]:
+            count = sev_counts.get(sev_label.lower(), 0)
+            parts.append(
+                f"<div class='stat-tile' style='border-top-color:{color}'>"
+                f"<div class='stat-num'>{count}</div>"
+                f"<div class='stat-label'>{sev_label}</div></div>")
+        parts.append("</div>")
+        parts.append("<div class='stat-row'>")
+        parts.append(f"<div class='stat-tile'><div class='stat-num'>"
+                     f"{len(unique_hosts)}</div>"
+                     f"<div class='stat-label'>Unique Hosts</div></div>")
+        parts.append(f"<div class='stat-tile'><div class='stat-num'>"
+                     f"{len(multi_hit)}</div>"
+                     f"<div class='stat-label'>Multi-Dork URLs</div></div>")
+        if cross_domain_urls:
+            parts.append(f"<div class='stat-tile'><div class='stat-num'>"
+                         f"{len(cross_domain_urls)}</div>"
+                         f"<div class='stat-label'>Cross-Domain URLs</div></div>")
+        for eng, cnt in engine_counts.most_common():
+            parts.append(f"<div class='stat-tile'><div class='stat-num'>"
+                         f"{cnt}</div>"
+                         f"<div class='stat-label'>{_esc(eng)}</div></div>")
+        parts.append("</div>")
+
+    # --- per-domain summary ---
+    parts.append("<h2>Per-Domain Summary</h2>"
+                 "<table><thead><tr><th>Domain</th><th>Findings</th>"
+                 "<th>Critical</th><th>High</th><th>Medium</th>"
+                 "<th>Low</th><th>Info</th></tr></thead><tbody>")
+    for domain in domains_list:
+        report_link = f"{domain}/dork/report.html"
+        sc = domain_sev[domain]
+        parts.append(
+            f"<tr><td><a href='{_esc(report_link)}'>"
+            f"<strong>{_esc(domain)}</strong></a></td>"
+            f"<td><span class='count'>{domain_total[domain]}</span></td>"
+            f"<td>{sc.get('critical', 0)}</td>"
+            f"<td>{sc.get('high', 0)}</td>"
+            f"<td>{sc.get('medium', 0)}</td>"
+            f"<td>{sc.get('low', 0)}</td>"
+            f"<td>{sc.get('info', 0)}</td></tr>")
+    parts.append("</tbody></table>")
+
+    # --- filter bar (with domain dropdown) ---
+    if all_flat:
+        parts.append(
+            "<div class='filter-bar' id='filterBar'>"
+            "<input type='text' id='filterText' "
+            "placeholder='Search URLs, titles, snippets...'>"
+            "<select id='filterDomain'><option value=''>All domains</option>"
+            "</select>"
+            "<select id='filterCat'><option value=''>All categories</option>"
+            "</select>"
+            "<select id='filterSev'><option value=''>All severities</option>"
+            "<option value='critical'>Critical</option>"
+            "<option value='high'>High</option>"
+            "<option value='medium'>Medium</option>"
+            "<option value='low'>Low</option>"
+            "<option value='info'>Info</option></select>"
+            "<select id='filterEngine'><option value=''>All engines</option>"
+            "<option value='ddg'>DDG</option>"
+            "<option value='google'>Google</option></select>"
+            "<button onclick='clearFilters()'>Clear</button>"
+            "<button onclick='copyVisibleUrls()'>Copy Visible URLs</button>"
+            "<span class='filter-count' id='filterCount'></span>"
+            "</div>")
+
+    # --- summary by category ---
+    parts.append("<h2>Summary by category</h2><table><thead><tr>"
+                 "<th>Category</th><th style='width:100px'>Severity</th>"
+                 "<th style='width:100px'>Findings</th>"
+                 "</tr></thead><tbody>")
+    for cat in sorted(by_cat.keys(), key=_cat_sort_key):
+        sev = CATEGORY_SEVERITY.get(cat, "info")
+        parts.append(
+            f"<tr><td><strong>{_esc(cat)}</strong></td>"
+            f"<td><span class='tag sev-{sev}'>{sev}</span></td>"
+            f"<td><span class='count'>{len(by_cat[cat])}</span></td></tr>")
+    parts.append("</tbody></table>")
+
+    # --- per-category findings ---
+    for cat in sorted(by_cat.keys(), key=_cat_sort_key):
+        sev = CATEGORY_SEVERITY.get(cat, "info")
+        parts.append(
+            f"<div class='cat-section sev-{sev}' data-category='{_esc(cat)}' "
+            f"data-severity='{sev}'>")
+        parts.append(
+            f"<h2>{_esc(cat)} "
+            f"<span class='tag sev-{sev}'>{sev}</span> "
+            f"<span class='meta'>({len(by_cat[cat])} findings)</span></h2>")
+        by_dork: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+        for domain, f in by_cat[cat]:
+            by_dork[f["dork_id"]].append((domain, f))
+        for dork_id, items in sorted(by_dork.items(),
+                                     key=lambda x: -len(x[1])):
+            query = items[0][1]["dork_query"]
+            parts.append(
+                f"<details open><summary>{_esc(dork_id)} "
+                f"<span class='count'>{len(items)}</span></summary>"
+                f"<p class='meta'><code>{_esc(query)}</code></p>"
+                "<table><thead><tr><th>Domain</th><th>URL / Title</th>"
+                "<th style='width:100px'>Engine</th></tr></thead><tbody>")
+            for domain, it in items:
+                title = it.get("title") or ""
+                snippet = it.get("snippet") or ""
+                url = it.get("url", "")
+                engine = it.get("engine", "")
+                parts.append(
+                    f"<tr class='finding-row' data-domain='{_esc(domain)}' "
+                    f"data-category='{_esc(cat)}' "
+                    f"data-severity='{sev}' data-engine='{_esc(engine)}' "
+                    f"data-url='{_esc(url)}'>"
+                    f"<td><strong>{_esc(domain)}</strong></td>"
+                    f"<td class='url-cell'>"
+                    f"<a href='{_esc(url)}' target='_blank' "
+                    f"rel='noopener'><strong>"
+                    f"{_esc(title) if title else _esc(url)}"
+                    f"</strong></a><br>"
+                    f"<code style='font-size:.8em'>{_esc(url)}</code>"
+                    + (f"<div class='snippet'>{_esc(snippet)}</div>"
+                       if snippet else "") +
+                    f"</td><td><span class='tag engine'>"
+                    f"{_esc(engine)}</span></td></tr>")
+            parts.append("</tbody></table></details>")
+        parts.append("</div>")
+
+    # --- cross-domain URLs ---
+    if cross_domain_urls:
+        parts.append(f"<h2>Cross-Domain URLs "
+                     f"<span class='meta'>({len(cross_domain_urls)})</span></h2>"
+                     "<p class='meta'>URLs that appeared in findings for "
+                     "multiple target domains</p>")
+        parts.append("<table><thead><tr><th>URL</th>"
+                     "<th style='width:80px'>Domains</th>"
+                     "<th>Seen On</th></tr></thead><tbody>")
+        for url, doms in sorted(cross_domain_urls.items(),
+                                key=lambda x: -len(x[1])):
+            parts.append(
+                f"<tr><td class='url-cell'><a href='{_esc(url)}' "
+                f"target='_blank' rel='noopener'>{_esc(url)}</a></td>"
+                f"<td><span class='multi-hit-count'>{len(doms)}</span></td>"
+                f"<td>{', '.join(_esc(d) for d in sorted(doms))}</td></tr>")
+        parts.append("</tbody></table>")
+
+    # --- multi-dork URLs ---
+    if multi_hit:
+        parts.append(f"<h2>URLs flagged by multiple dorks "
+                     f"<span class='meta'>({len(multi_hit)})</span></h2>")
+        parts.append("<table><thead><tr><th>URL</th>"
+                     "<th style='width:80px'>Dorks</th>"
+                     "<th>Matched By</th></tr></thead><tbody>")
+        for url, dork_ids in sorted(multi_hit.items(),
+                                    key=lambda x: -len(x[1])):
+            parts.append(
+                f"<tr><td class='url-cell'><a href='{_esc(url)}' "
+                f"target='_blank' rel='noopener'>{_esc(url)}</a></td>"
+                f"<td><span class='multi-hit-count'>{len(dork_ids)}</span></td>"
+                f"<td>{', '.join(_esc(d) for d in sorted(dork_ids))}</td></tr>")
+        parts.append("</tbody></table>")
+
+    # --- zero-hit dorks ---
+    if zero_hit:
+        parts.append(f"<details><summary>Dorks with 0 results across all "
+                     f"domains <span class='count'>{len(zero_hit)}</span>"
+                     f"</summary>")
+        parts.append("<table><thead><tr><th>Category</th><th>Dork ID</th>"
+                     "<th>Query</th></tr></thead><tbody>")
+        for c, d, qs in zero_hit:
+            if len(qs) == 1:
+                q_display = qs[0]
+            else:
+                q_display = f"{qs[0]}  (+{len(qs) - 1} domain variants)"
+            parts.append(f"<tr><td>{_esc(c)}</td><td>{_esc(d)}</td>"
+                         f"<td><code>{_esc(q_display)}</code></td></tr>")
+        parts.append("</tbody></table></details>")
+
+    if not all_flat:
+        parts.append("<p>No findings across any domain.</p>")
+
+    # --- inline JavaScript for filtering (with domain support) ---
+    parts.append("""<script>
+(function(){
+  var rows=document.querySelectorAll('.finding-row');
+  var sections=document.querySelectorAll('.cat-section');
+  var tF=document.getElementById('filterText');
+  var fD=document.getElementById('filterDomain');
+  var fC=document.getElementById('filterCat');
+  var fS=document.getElementById('filterSev');
+  var fE=document.getElementById('filterEngine');
+  var fCount=document.getElementById('filterCount');
+  if(!tF)return;
+  var doms=new Set();var cats=new Set();
+  rows.forEach(function(r){doms.add(r.dataset.domain);cats.add(r.dataset.category)});
+  doms.forEach(function(d){
+    var o=document.createElement('option');o.value=d;o.textContent=d;fD.appendChild(o);
+  });
+  cats.forEach(function(c){
+    var o=document.createElement('option');o.value=c;o.textContent=c;fC.appendChild(o);
+  });
+  function applyFilters(){
+    var text=(tF.value||'').toLowerCase();
+    var dom=fD.value;var cat=fC.value;var sev=fS.value;var eng=fE.value;
+    var visible=0;
+    rows.forEach(function(r){
+      var show=true;
+      if(dom&&r.dataset.domain!==dom)show=false;
+      if(cat&&r.dataset.category!==cat)show=false;
+      if(sev&&r.dataset.severity!==sev)show=false;
+      if(eng&&r.dataset.engine!==eng)show=false;
+      if(text&&r.textContent.toLowerCase().indexOf(text)<0)show=false;
+      r.style.display=show?'':'none';
+      if(show)visible++;
+    });
+    sections.forEach(function(s){
+      var any=false;
+      s.querySelectorAll('.finding-row').forEach(function(r){
+        if(r.style.display!=='none')any=true;
+      });
+      s.style.display=any?'':'none';
+    });
+    fCount.textContent=visible+'/'+rows.length+' findings';
+  }
+  tF.addEventListener('input',applyFilters);
+  fD.addEventListener('change',applyFilters);
+  fC.addEventListener('change',applyFilters);
+  fS.addEventListener('change',applyFilters);
+  fE.addEventListener('change',applyFilters);
+  applyFilters();
+  window.clearFilters=function(){tF.value='';fD.value='';fC.value='';fS.value='';fE.value='';applyFilters()};
+  window.copyVisibleUrls=function(){
+    var urls=[];
+    rows.forEach(function(r){if(r.style.display!=='none')urls.push(r.dataset.url)});
+    var unique=[...new Set(urls)];
+    var text=unique.join('\\n');
+    function fallback(){
+      var ta=document.createElement('textarea');
+      ta.value=text;ta.style.position='fixed';ta.style.opacity='0';
+      document.body.appendChild(ta);ta.select();
+      try{document.execCommand('copy');alert('Copied '+unique.length+' URLs')}
+      catch(e){alert('Copy failed — select and copy manually:\\n'+text)}
+      document.body.removeChild(ta);
+    }
+    if(navigator.clipboard&&window.isSecureContext){
+      navigator.clipboard.writeText(text).then(function(){
+        alert('Copied '+unique.length+' URLs');
+      },fallback);
+    }else{fallback()}
+  };
+})();
+</script>""")
+
+    parts.append("</body></html>")
+    out = output_root / "combined_dork_report.html"
+    out.write_text("".join(parts))
+    log.info("wrote combined report: %s", out)
 
 
 # --------------------------- entry ---------------------------
